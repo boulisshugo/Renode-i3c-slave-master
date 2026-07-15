@@ -1,0 +1,8 @@
+# Renode checkout created by setup.sh
+/renode/
+
+# Build artifacts
+bin/
+obj/
+output/
+*.user
