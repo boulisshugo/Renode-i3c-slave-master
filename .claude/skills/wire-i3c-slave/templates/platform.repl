@@ -1,0 +1,39 @@
+// Template platform wiring an I3C master to a proprietary slave (and, optionally, a firmware-managed
+// slave on both the sysbus and the I3C bus). Load with:
+//   machine LoadPlatformDescription @path/to/this.repl
+
+// --- I3C master ------------------------------------------------------------------------------------
+i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+
+// --- Simple proprietary slave (I3C bus only) -------------------------------------------------------
+// Prefix "I3C." because the class lives in namespace ...Peripherals.I3C.
+// Registers on the controller (@ i3c) at its I3C address; constructor params are indented by name.
+slave: I3C.MyProprietaryI3CSlave @ i3c 0x08
+    provisionedId: 0x1234567890AB
+    busCharacteristics: 0x02
+    deviceCharacteristics: 0xC5
+    staticAddress: 0x50
+
+// --- Firmware-managed slave (memory-mapped + I3C) --------------------------------------------------
+// A single instance registered on TWO buses via the @ { ... } form: the sysbus for the CPU firmware
+// (MMIO registers) and the i3c bus for the master. Uncomment together with a CPU + memory.
+//
+// cpu: CPU.RiscV32 @ sysbus
+//     cpuType: "rv32imac"
+//     timeProvider: clint
+//
+// clint: IRQControllers.CoreLevelInterruptor @ sysbus 0x02000000
+//     frequency: 1000000
+//     [0, 1] -> cpu@[3, 7]
+//
+// mem: Memory.MappedMemory @ sysbus 0x80000000
+//     size: 0x100000
+//
+// uart: UART.MiV_CoreUART @ sysbus 0x70001000
+//     clockFrequency: 66000000
+//
+// fwslave: I3C.InventedI3CTarget @ {
+//         sysbus 0x90000000;
+//         i3c 0x09
+//     }
+//     provisionedId: 0x1122334455
