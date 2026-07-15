@@ -6,3 +6,6 @@ bin/
 obj/
 output/
 *.user
+
+# Java build output
+/java/out/

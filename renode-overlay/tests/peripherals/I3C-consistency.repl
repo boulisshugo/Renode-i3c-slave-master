@@ -1,0 +1,5 @@
+i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+
+echo: Mocks.EchoI3CDevice @ i3c 0x08
+
+dummy: Mocks.DummyI3CSlave @ i3c 0x09

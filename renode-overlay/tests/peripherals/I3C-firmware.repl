@@ -1,0 +1,23 @@
+mem: Memory.MappedMemory @ sysbus 0x80000000
+    size: 0x100000
+
+uart: UART.MiV_CoreUART @ sysbus 0x70001000
+    clockFrequency: 66000000
+
+cpu: CPU.RiscV32 @ sysbus
+    cpuType: "rv32imac"
+    timeProvider: clint
+
+clint: IRQControllers.CoreLevelInterruptor @ sysbus 0x02000000
+    frequency: 1000000
+    [0, 1] -> cpu@[3, 7]
+
+// The firmware-managed I3C slave: memory-mapped registers on the sysbus (for the CPU firmware) and
+// an I3C target on the i3c bus (for the master).
+i3ctarget: I3C.InventedI3CTarget @ {
+        sysbus 0x90000000;
+        i3c 0x08
+    }
+    provisionedId: 0x1122334455
+
+i3c: I3C.SimpleI3CController @ sysbus 0x40010000

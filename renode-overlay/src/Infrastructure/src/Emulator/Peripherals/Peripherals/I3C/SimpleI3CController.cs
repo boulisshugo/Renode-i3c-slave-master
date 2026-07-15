@@ -172,6 +172,12 @@ namespace Antmicro.Renode.Peripherals.I3C
         // Payload (MDB + data) of the most recent IBI, hex-encoded (monitor-readable).
         public string LastInBandInterruptPayloadHex => Misc.PrettyPrintCollectionHex(lastInBandInterruptPayload);
 
+        // Returns the target registered at the given address, or null if none is registered there.
+        public II3CPeripheral GetTarget(int address)
+        {
+            return TryGetByAddress(address, out var target) ? target : null;
+        }
+
         private bool TryGetTarget(int address, out II3CPeripheral target)
         {
             if(!TryGetByAddress(address, out target))

@@ -4,6 +4,7 @@ slave0: Mocks.DummyI3CSlave @ i3c 0x08
     provisionedId: 0x1234567890AB
     busCharacteristics: 0x02
     deviceCharacteristics: 0xC5
+    staticAddress: 0x50
 
 slave1: Mocks.DummyI3CSlave @ i3c 0x09
     provisionedId: 0xAABBCCDDEEFF

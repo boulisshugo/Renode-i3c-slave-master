@@ -24,14 +24,37 @@ else
     echo ">> Reusing existing Renode checkout at $RENODE_DIR"
 fi
 
-echo ">> Overlaying I3C peripherals and tests"
+echo ">> Building the firmware (if a RISC-V toolchain is available)"
+if command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then
+    "$HERE/firmware/build.sh"
+    cp "$HERE/firmware/i3c-firmware.elf" "$HERE/renode-overlay/tests/peripherals/"
+else
+    echo "   (skipping - using the pre-built firmware/i3c-firmware.elf committed in the repo)"
+fi
+
+echo ">> Overlaying I3C peripherals, tests and firmware"
 # The overlay mirrors Renode's directory layout, so this drops each file in place.
 cp -rv "$HERE/renode-overlay/." "$RENODE_DIR/"
 
 echo ">> Building Renode (headless)"
 ( cd "$RENODE_DIR" && ./build.sh --no-gui )
 
-echo ">> Running the I3C robot test"
-( cd "$RENODE_DIR" && ./renode-test tests/peripherals/I3C.robot )
+echo ">> Building the Java I3C bridge client (if a JDK is available)"
+JAVA_SUITE=""
+if command -v javac >/dev/null 2>&1; then
+    "$HERE/java/build.sh"
+    export I3C_JAVA_CP="$HERE/java/out"
+    JAVA_SUITE="tests/peripherals/I3C-java.robot"
+else
+    echo "   (skipping Java bridge build - JDK not found)"
+fi
+
+echo ">> Running the I3C robot suites"
+( cd "$RENODE_DIR" && ./renode-test \
+    tests/peripherals/I3C.robot \
+    tests/peripherals/I3C-consistency.robot \
+    tests/peripherals/I3C-firmware.robot \
+    ${JAVA_SUITE} )
 
 echo ">> All done."
+echo ">> For a standalone Java reliability run: java/run-integration.sh"
