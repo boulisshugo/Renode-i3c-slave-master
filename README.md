@@ -31,8 +31,10 @@ paths they occupy inside a Renode checkout:
 | `SimpleI3CPeripheral.cs` | Agnostic slave base class with `virtual` hooks — **subclass this to wire proprietary logic**. |
 | `DummyI3CSlave.cs` | Ready-to-use mock target (buffers + events), the I3C analog of `DummyI2CSlave`. |
 | `SimpleI3CController.cs` | Agnostic master; a `SimpleContainer<II3CPeripheral>` that drives transfers, CCCs, ENTDAA and captures IBIs. |
+| `I3CTCPBridge.cs` | Raw TCP bridge to a target: TCP bytes → private write to the slave; the slave's response → TCP. |
 | `tests/peripherals/I3C.repl` | Example platform wiring a controller and two targets. |
-| `tests/peripherals/I3C.robot` | Robot test covering private R/W, dynamic addressing, CCCs and IBI. |
+| `tests/peripherals/I3C.robot` | Robot test covering private R/W, dynamic addressing, CCCs, IBI and the TCP bridge. |
+| `tests/peripherals/I3C-helpers.py` | Robot helper: a raw TCP client used to exercise the bridge. |
 
 ## The `II3CPeripheral` contract
 
@@ -101,6 +103,33 @@ slave0: I3C.DummyI3CSlave @ i3c 0x08
 (machine) i3c LastInBandInterruptAddress             # -> 8
 (machine) i3c.IRQ                                     # IBI drives this GPIO line
 ```
+
+## TCP bridge
+
+`I3CTCPBridge` exposes a target on the controller over a raw TCP socket, so an external program can
+drive a proprietary I3C target through Renode. Bytes received from the TCP client are transmitted to
+the target as an SDR **private write**, and the target's **read** response is streamed straight back to
+the client — a transparent, frameless byte pipe realising the common I3C write-then-read exchange.
+
+Create it from the monitor (it starts listening immediately):
+
+```
+(machine) emulation CreateI3CTCPBridge sysbus.i3c 0x08 3456
+```
+
+Then, from any TCP client:
+
+```python
+import socket
+s = socket.create_connection(("127.0.0.1", 3456))
+s.sendall(bytes.fromhex("DEADBEEF"))  # transmitted to the target as a private write
+print(s.recv(4).hex())                # the bytes the target returned on the read side
+```
+
+By default the bridge reads back as many bytes as it just wrote (mirroring). For fixed-length responses
+set `ReadLength` on the bridge to a positive value. Because TCP is a byte stream with no message
+boundaries, each chunk delivered by the socket becomes one write-then-read exchange; the read buffer is
+sized so a small message normally arrives whole.
 
 ## Wiring a proprietary target
 

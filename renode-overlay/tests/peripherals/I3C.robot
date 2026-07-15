@@ -4,6 +4,10 @@ Suite Teardown                  Teardown
 Test Setup                      Reset Emulation
 Test Teardown                   Test Teardown
 Resource                        ${RENODEKEYWORDS}
+Library                         ${CURDIR}/I3C-helpers.py
+
+*** Variables ***
+${BRIDGE_PORT}                  33567
 
 *** Keywords ***
 Create Machine
@@ -77,3 +81,18 @@ Should Capture In Band Interrupt
     Execute Command             i3c AcknowledgeInBandInterrupt
     ${irq}=                     Execute Command  i3c IRQ IsSet
     Should Be Equal             ${irq.strip()}  False
+
+Should Bridge Raw Data Over TCP
+    Create Machine
+    Execute Command             emulation CreateI3CTCPBridge sysbus.i3c 0x08 ${BRIDGE_PORT}
+
+    # Queue the bytes the target will "transmit" back on the read side of the exchange.
+    Execute Command             i3c.slave0 EnqueueResponseBytesHex "01020304"
+
+    # Send raw bytes over TCP; the bridge writes them to the target and returns the target's response.
+    ${response}=                Transfer Over I3C Bridge  ${BRIDGE_PORT}  DEADBEEF
+    Should Be Equal             ${response}  01020304
+
+    # The raw bytes sent over TCP reached the target as a private write.
+    ${rx}=                      Execute Command  i3c.slave0 LastReceivedHex
+    Should Contain              ${rx}  [0xDE, 0xAD, 0xBE, 0xEF]
