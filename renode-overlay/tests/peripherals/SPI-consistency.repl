@@ -1,0 +1,5 @@
+spi: SPI.SimpleSPIController @ sysbus 0x40011000
+
+echo: Mocks.EchoSPIDevice @ spi 0
+
+dummy: Mocks.DummySPITarget @ spi 1

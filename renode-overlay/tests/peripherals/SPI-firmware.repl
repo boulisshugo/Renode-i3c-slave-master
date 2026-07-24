@@ -1,0 +1,22 @@
+mem: Memory.MappedMemory @ sysbus 0x80000000
+    size: 0x100000
+
+uart: UART.MiV_CoreUART @ sysbus 0x70001000
+    clockFrequency: 66000000
+
+cpu: CPU.RiscV32 @ sysbus
+    cpuType: "rv32imac"
+    timeProvider: clint
+
+clint: IRQControllers.CoreLevelInterruptor @ sysbus 0x02000000
+    frequency: 1000000
+    [0, 1] -> cpu@[3, 7]
+
+// The firmware-managed SPI slave: memory-mapped registers on the sysbus (for the CPU firmware) and
+// an SPI target on the spi bus (for the controller).
+spitarget: SPI.InventedSPITarget @ {
+        sysbus 0x90000000;
+        spi 0
+    }
+
+spi: SPI.SimpleSPIController @ sysbus 0x40011000

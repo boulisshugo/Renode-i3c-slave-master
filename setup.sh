@@ -28,8 +28,10 @@ echo ">> Building the firmware (if a RISC-V toolchain is available)"
 if command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then
     "$HERE/firmware/build.sh"
     cp "$HERE/firmware/i3c-firmware.elf" "$HERE/renode-overlay/tests/peripherals/"
+    "$HERE/firmware-spi/build.sh"
+    cp "$HERE/firmware-spi/spi-firmware.elf" "$HERE/renode-overlay/tests/peripherals/"
 else
-    echo "   (skipping - using the pre-built firmware/i3c-firmware.elf committed in the repo)"
+    echo "   (skipping - using the pre-built *-firmware.elf committed in the repo)"
 fi
 
 echo ">> Overlaying I3C peripherals, tests and firmware"
@@ -39,22 +41,27 @@ cp -rv "$HERE/renode-overlay/." "$RENODE_DIR/"
 echo ">> Building Renode (headless)"
 ( cd "$RENODE_DIR" && ./build.sh --no-gui )
 
-echo ">> Building the Java I3C bridge client (if a JDK is available)"
-JAVA_SUITE=""
+echo ">> Building the Java bridge clients (if a JDK is available)"
+JAVA_SUITES=""
 if command -v javac >/dev/null 2>&1; then
     "$HERE/java/build.sh"
+    "$HERE/java-spi/build.sh"
     export I3C_JAVA_CP="$HERE/java/out"
-    JAVA_SUITE="tests/peripherals/I3C-java.robot"
+    export I3C_SPI_JAVA_CP="$HERE/java-spi/out"
+    JAVA_SUITES="tests/peripherals/I3C-java.robot tests/peripherals/SPI-java.robot"
 else
     echo "   (skipping Java bridge build - JDK not found)"
 fi
 
-echo ">> Running the I3C robot suites"
+echo ">> Running the I3C and SPI robot suites"
 ( cd "$RENODE_DIR" && ./renode-test \
     tests/peripherals/I3C.robot \
     tests/peripherals/I3C-consistency.robot \
     tests/peripherals/I3C-firmware.robot \
-    ${JAVA_SUITE} )
+    tests/peripherals/SPI.robot \
+    tests/peripherals/SPI-consistency.robot \
+    tests/peripherals/SPI-firmware.robot \
+    ${JAVA_SUITES} )
 
 echo ">> All done."
-echo ">> For a standalone Java reliability run: java/run-integration.sh"
+echo ">> For standalone Java reliability runs: java/run-integration.sh and java-spi/run-integration.sh"

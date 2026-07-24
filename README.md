@@ -1,10 +1,13 @@
-# Agnostic I3C master & slave for Renode
+# Agnostic I3C & SPI master/slave for Renode
 
-Generic, reusable **I3C controller (master)** and **I3C target (slave)** models for
-[Renode](https://github.com/renode/renode). They are deliberately *agnostic*: they do not model any
-specific SoC's register map. Instead they provide a small, well-defined transaction-level interface
-that proprietary I3C target implementations can plug into, and a controller that can drive them from a
-C# test-bench, the Renode monitor, or robot tests.
+Generic, reusable **controller (master)** and **target (slave)** models for
+[Renode](https://github.com/renode/renode), for both **I3C** and **SPI**. They are deliberately
+*agnostic*: they do not model any specific SoC's register map. Instead they provide a small,
+well-defined transaction-level interface that proprietary target implementations can plug into, and a
+controller that can drive them from a C# test-bench, the Renode monitor, or robot tests.
+
+Most of this README describes the I3C models; the **SPI** counterpart mirrors them one-to-one — see the
+[SPI counterpart](#spi-counterpart) section and the `wire-spi-slave` skill.
 
 ## Why transaction-level (method calls) rather than raw SDA/SCL?
 
@@ -227,3 +230,36 @@ GPIO line on the controller).
 Out of scope (kept simple on purpose): bit-level SDA/SCL signalling and bus arbitration, HDR transfer
 modes, hot-join, and the full CCC set. `SimpleContainer` keys targets by a single integer address, so
 ENTDAA here assigns the registration address rather than arbitrating on Provisioned IDs.
+
+## SPI counterpart
+
+The same design is mirrored for **SPI**, built on Renode's existing `ISPIPeripheral`
+(`byte Transmit(byte)` + `FinishTransmission()`) rather than a new interface. SPI is full-duplex and
+selects a target by **chip-select** (not a bus address); it has no dynamic addressing, CCCs or IBIs —
+the slave→master signal is a side-band **data-ready interrupt** (the analog of an I3C IBI).
+
+| I3C | SPI equivalent |
+|-----|----------------|
+| `SimpleI3CPeripheral` | `SimpleSPIPeripheral` — base with a `byte OnTransfer(byte)` hook + response buffer |
+| `DummyI3CSlave` / `EchoI3CDevice` | `Mocks.DummySPITarget` (records MOSI) / `Mocks.EchoSPIDevice` (loopback) |
+| `SimpleI3CController` | `SimpleSPIController` — `SimpleContainer<ISPIPeripheral>`, chip-select, `TransferHex` |
+| `I3CTCPBridge` | `SPITCPBridge` — full-duplex (N in → N out) + forward-on-interrupt mode |
+| `InventedI3CTarget` | `InventedSPITarget` — MMIO + `ISPIPeripheral`, RX/TX FIFOs, interrupt on commit |
+| `firmware/` (RISC-V) | `firmware-spi/` (RISC-V, same register map) |
+| `java/` | `java-spi/` (`sendData`/`isDataAvailable`/`receiveData` + reliability harness) |
+| `tests/peripherals/I3C*.robot` | `tests/peripherals/SPI*.robot` (per-feature, consistency, firmware, java) |
+
+Drive it the same way (chip select instead of address):
+
+```
+(machine) spi TransferHex 0 "DEADBEEF"                 # full-duplex exchange -> hex MISO
+(machine) emulation CreateSPITCPBridge sysbus.spi 0 3456        # full-duplex bridge
+(machine) emulation CreateSPITCPBridge sysbus.spi 0 3456 true   # forward-on-interrupt bridge (firmware slave)
+```
+
+Verified end-to-end, Java → bridge → controller → firmware-managed SPI slave → back: **100% reliability**
+over 1000+ round-trips (16–250 bytes, avg ~1.3 ms). All SPI robot suites pass.
+
+One SPI-specific subtlety worth noting: in the firmware-managed target, MISO stays 0 during the command
+phase and the response is delivered only via the interrupt — otherwise the controller's ongoing full-duplex
+clocks could consume the firmware's response bytes as discarded MISO before the interrupt fires.

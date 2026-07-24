@@ -1,0 +1,37 @@
+// Template platform wiring an SPI master to a proprietary slave (and, optionally, a firmware-managed
+// slave on both the sysbus and the SPI bus). Load with:
+//   machine LoadPlatformDescription @path/to/this.repl
+
+// --- SPI master ------------------------------------------------------------------------------------
+spi: SPI.SimpleSPIController @ sysbus 0x40011000
+
+// --- Simple proprietary slave (SPI bus only) -------------------------------------------------------
+// Prefix "SPI." because the class lives in namespace ...Peripherals.SPI.
+// Registers on the controller (@ spi) at its chip-select index.
+slave0: SPI.MyProprietarySPISlave @ spi 0
+
+// A second target on another chip select.
+// slave1: SPI.MyProprietarySPISlave @ spi 1
+
+// --- Firmware-managed slave (memory-mapped + SPI) --------------------------------------------------
+// A single instance registered on TWO buses via the @ { ... } form: the sysbus for the CPU firmware
+// (MMIO registers) and the spi bus for the controller. Uncomment together with a CPU + memory.
+//
+// cpu: CPU.RiscV32 @ sysbus
+//     cpuType: "rv32imac"
+//     timeProvider: clint
+//
+// clint: IRQControllers.CoreLevelInterruptor @ sysbus 0x02000000
+//     frequency: 1000000
+//     [0, 1] -> cpu@[3, 7]
+//
+// mem: Memory.MappedMemory @ sysbus 0x80000000
+//     size: 0x100000
+//
+// uart: UART.MiV_CoreUART @ sysbus 0x70001000
+//     clockFrequency: 66000000
+//
+// fwslave: SPI.InventedSPITarget @ {
+//         sysbus 0x90000000;
+//         spi 0
+//     }
