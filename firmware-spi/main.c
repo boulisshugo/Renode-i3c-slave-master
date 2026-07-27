@@ -1,10 +1,11 @@
 /*
  * Tiny bare-metal "OS" for the firmware-managed SPI slave.
  *
- * It drives the invented SPI target peripheral (SPI.InventedSPITarget). SPI slaves cannot push, so the
- * response is delivered by having the master poll: the firmware reads the command from the RX FIFO,
- * then writes a length-prefixed response into the TX FIFO ([N, byte0..byteN-1]) and commits it. The
- * master then clocks a status byte until it reads N (ready), and clocks out the N response bytes.
+ * It drives the invented SPI target peripheral (SPI.InventedSPITarget). SPI slaves cannot push a
+ * response onto the command clocks, so the answer is delivered by an interrupt: the firmware reads the
+ * command from the RX FIFO, writes the response bytes into the TX FIFO, and commits. On commit the
+ * peripheral asserts its data-ready interrupt carrying those bytes, which the SPI bridge forwards to its
+ * client. No length prefix is needed - the interrupt payload length is exactly what was committed.
  */
 #include <stdint.h>
 
@@ -41,8 +42,7 @@ int main(void)
             {
                 buf[n++] = (uint8_t)SPI_RX_DATA;
             }
-            /* Write a length-prefixed echo response and commit it for the master to poll. */
-            SPI_TX_DATA = (uint8_t)n;
+            /* Write the echo response and commit it; the commit asserts the data-ready interrupt. */
             for(uint32_t i = 0; i < n; i++)
             {
                 SPI_TX_DATA = buf[i];

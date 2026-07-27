@@ -5,13 +5,12 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
-using System.Linq;
-using System.Threading;
 
 using Antmicro.Migrant;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.SPI
@@ -21,49 +20,52 @@ namespace Antmicro.Renode.Peripherals.SPI
         // Creates a raw TCP bridge to a target on a SimpleSPIController.
         //
         // Monitor usage:
-        //   emulation CreateSPITCPBridge sysbus.spi 0 3456                       # full-duplex mode
-        //   emulation CreateSPITCPBridge sysbus.spi 0 3456 true                  # forward-on-interrupt mode
-        //   emulation CreateSPITCPBridge sysbus.spi 0 3456 false true            # poll-for-response mode
-        //   emulation CreateSPITCPBridge sysbus.spi 0 3456 false false true      # full-duplex, strip 0xFF idle
+        //   emulation CreateSPITCPBridge sysbus.spi 0 3456          # full-duplex mode (default)
+        //   emulation CreateSPITCPBridge sysbus.spi 0 3456 true     # forward-on-interrupt mode
         //
-        // - full-duplex: the MISO bytes returned by the same transfer are streamed back (synchronous
-        //   slaves).
-        // - forward-on-interrupt: the response arrives when the target asserts its interrupt line
-        //   (a slave with a side-band IRQ pin).
-        // - poll-for-response: after clocking the command, the master POLLS the slave (SPI slaves cannot
-        //   push) - clocking a status byte until it becomes non-zero (the length), then clocking out
-        //   that many response bytes. This is the right mode for the firmware-managed InventedSPITarget.
+        // The client speaks RAW bytes in both directions: whatever it sends is clocked to the slave, and
+        // whatever the slave drives back is streamed to the client unmodified - no framing, no length
+        // bytes, no idle-byte filtering added by the bridge.
         //
-        // stripIdleBytes: when true, the bridge drops the slave's idle/busy filler bytes (0xFF by
-        // default, see SPITCPBridge.IdleByte) from what it forwards to the client, so the client sees
-        // only the bytes the slave actually drove. Leave it off (the default) for binary-clean transfers
-        // where 0xFF is legitimate data.
+        // - full-duplex: the client is the master's brain. The bytes it sends are clocked out on MOSI and
+        //   the MISO bytes shifted back in the SAME transfer are returned. The client decides how many
+        //   bytes to clock (command + any read/dummy bytes), so it frames its own reads. This is the mode
+        //   for synchronous slaves that drive their answer on the same clocks (e.g. EchoSPIDevice).
+        // - forward-on-interrupt: for a slave whose answer is not ready on the command clocks (a
+        //   firmware-managed slave). The client sends the command; the bridge clocks it in and returns
+        //   nothing yet; when the slave later asserts its data-ready line, its raw payload is forwarded to
+        //   the client. This is the deterministic SPI analog of an I3C In-Band Interrupt - it replaces
+        //   host-thread polling, which could never share the CPU's simulation time.
+        //
+        // Determinism: every access the bridge makes to the controller and the slave is marshalled onto
+        // the emulation's time-domain thread (see SPITCPBridge.HandleDataReceived). The controller drives
+        // the slave in the SAME simulation time as the emulated CPU, never concurrently with it, so a run
+        // is reproducible regardless of host socket timing.
         public static void CreateSPITCPBridge(this Emulation emulation, SimpleSPIController controller,
-            int chipSelect, int port, bool forwardOnInterrupt = false, bool pollForResponse = false,
-            bool stripIdleBytes = false, string name = "spiBridge")
+            int chipSelect, int port, bool forwardOnInterrupt = false, string name = "spiBridge")
         {
             if(port < 0 || port > 65535)
             {
                 throw new RecoverableException("Port must be between 0 and 65535");
             }
             emulation.ExternalsManager.AddExternal(
-                new SPITCPBridge(controller, chipSelect, port, forwardOnInterrupt, pollForResponse, stripIdleBytes), name);
+                new SPITCPBridge(controller, chipSelect, port, forwardOnInterrupt), name);
         }
     }
 
-    // Bridges a single target on a SimpleSPIController to a raw TCP socket. See CreateSPITCPBridge for
-    // the response-delivery modes and the idle-byte stripping option.
+    // Bridges a single target on a SimpleSPIController to a raw TCP socket. See CreateSPITCPBridge for the
+    // two response-delivery modes and the determinism guarantee.
     [Transient]
     public class SPITCPBridge : IExternal, IDisposable
     {
         public SPITCPBridge(SimpleSPIController controller, int chipSelect, int port,
-            bool forwardOnInterrupt = false, bool pollForResponse = false, bool stripIdleBytes = false)
+            bool forwardOnInterrupt = false)
         {
             this.controller = controller;
             this.chipSelect = chipSelect;
             this.forwardOnInterrupt = forwardOnInterrupt;
-            this.pollForResponse = pollForResponse;
-            StripIdleBytes = stripIdleBytes;
+            // The machine that owns the controller - used to run every transfer inside its time domain.
+            machine = controller.GetMachine();
 
             server = new SocketServerProvider(telnetMode: false, serverName: "SPIBridge");
             // Read up to a full chunk per recv so a message is delivered as one block, not byte-by-byte.
@@ -86,9 +88,8 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
 
             server.Start(port);
-            this.Log(LogLevel.Info, "SPI TCP bridge for chip select {0} listening on port {1} ({2}{3})",
-                chipSelect, port, forwardOnInterrupt ? "forward-on-interrupt" : (pollForResponse ? "poll-for-response" : "full-duplex"),
-                StripIdleBytes ? ", stripping idle bytes" : "");
+            this.Log(LogLevel.Info, "SPI TCP bridge for chip select {0} listening on port {1} ({2})",
+                chipSelect, port, forwardOnInterrupt ? "forward-on-interrupt" : "full-duplex");
         }
 
         public void Dispose()
@@ -101,16 +102,13 @@ namespace Antmicro.Renode.Peripherals.SPI
             server.Stop();
         }
 
-        // Max time to poll a firmware-managed slave for its response.
-        public int PollTimeoutMilliseconds { get; set; } = 5000;
-
-        // When true, IdleByte values are removed from the bytes forwarded to the TCP client.
-        public bool StripIdleBytes { get; set; }
-
-        // The slave's idle/busy MISO value to drop when StripIdleBytes is set. SPI MISO idles high, so
-        // this is 0xFF by default.
-        public byte IdleByte { get; set; } = 0xFF;
-
+        // Called on the host socket thread when the client sends raw bytes. We do NOT touch the controller
+        // or the slave here: instead we hand the transaction to the machine's time domain so it runs on
+        // the emulation thread, serialised with (never concurrent to) CPU execution. This is what makes
+        // the bridge deterministic and puts the controller and slave on the same simulation clock.
+        //
+        // The whole transfer, and the reply back to the client, happen inside DriveTransfer, because the
+        // marshalled call does not block this host thread waiting for a result.
         private void HandleDataReceived(byte[] data)
         {
             if(data == null || data.Length == 0)
@@ -118,96 +116,50 @@ namespace Antmicro.Renode.Peripherals.SPI
                 return;
             }
 
-            this.Log(LogLevel.Debug, "Bridge received {0} bytes from TCP, sending to chip select {1}: {2}",
+            this.Log(LogLevel.Debug, "Bridge received {0} bytes from TCP for chip select {1}: {2}",
                 data.Length, chipSelect, Misc.PrettyPrintCollectionHex(data));
 
-            if(pollForResponse)
-            {
-                PollForResponse(data);
-                return;
-            }
+            machine.HandleTimeDomainEvent<byte[]>(DriveTransfer, data, timeDomainInternalEvent: false);
+        }
 
-            var response = controller.Transfer(chipSelect, data);
+        // Runs on the emulation's time-domain thread. Clocks the client's bytes to the slave through the
+        // controller and, in full-duplex mode, streams the MISO bytes straight back.
+        private void DriveTransfer(byte[] data)
+        {
+            var miso = controller.Transfer(chipSelect, data);
             if(forwardOnInterrupt)
             {
-                // The response arrives asynchronously via the target's interrupt line.
+                // The response is delivered later, when the slave asserts its data-ready line (see
+                // HandleInterrupt). The MISO clocked back during the command is idle filler - ignore it.
                 return;
             }
-            ForwardToClient(response);
+            ForwardToClient(miso);
         }
 
-        private void PollForResponse(byte[] command)
-        {
-            // 1. Clock the command to the slave (one chip-select transaction).
-            controller.Transfer(chipSelect, command);
-
-            // 2. Poll: hold chip select, clock a status byte until it is non-zero (the response length),
-            //    then clock out that many response bytes.
-            controller.Select(chipSelect);
-            try
-            {
-                var length = 0;
-                var deadline = DateTime.UtcNow.AddMilliseconds(PollTimeoutMilliseconds);
-                while(DateTime.UtcNow < deadline)
-                {
-                    var status = controller.Transmit(chipSelect, 0x00);
-                    if(status != 0)
-                    {
-                        length = status;
-                        break;
-                    }
-                    Thread.Sleep(1); // let the emulated firmware run
-                }
-
-                if(length == 0)
-                {
-                    this.Log(LogLevel.Warning, "Timed out polling chip select {0} for a response", chipSelect);
-                    return;
-                }
-
-                var response = new byte[length];
-                for(var i = 0; i < length; i++)
-                {
-                    response[i] = controller.Transmit(chipSelect, 0x00);
-                }
-                ForwardToClient(response);
-            }
-            finally
-            {
-                controller.Deselect(chipSelect);
-            }
-        }
-
+        // Fired from the emulation thread when a forward-on-interrupt slave asserts its data-ready line.
+        // The payload is the raw response the slave wants to hand back.
         private void HandleInterrupt(ISPIPeripheral source, byte[] payload)
         {
             ForwardToClient(payload);
         }
 
-        // Sends bytes to the connected TCP client, optionally dropping the slave's idle/busy filler.
+        // Sends raw bytes to the connected TCP client, exactly as the slave drove them.
         private void ForwardToClient(byte[] data)
         {
             if(data == null || data.Length == 0)
             {
                 return;
             }
-            if(StripIdleBytes)
-            {
-                data = data.Where(b => b != IdleByte).ToArray();
-                if(data.Length == 0)
-                {
-                    return;
-                }
-            }
-            this.Log(LogLevel.Debug, "Bridge forwarding {0} bytes to TCP: {1}",
+            this.Log(LogLevel.Debug, "Bridge forwarding {0} raw bytes to TCP: {1}",
                 data.Length, Misc.PrettyPrintCollectionHex(data));
             server.Send(data);
         }
 
+        private readonly IMachine machine;
         private readonly SocketServerProvider server;
         private readonly SimpleSPIController controller;
         private readonly SimpleSPIPeripheral target;
         private readonly int chipSelect;
         private readonly bool forwardOnInterrupt;
-        private readonly bool pollForResponse;
     }
 }

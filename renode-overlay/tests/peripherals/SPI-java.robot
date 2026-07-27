@@ -18,7 +18,7 @@ Create Firmware Machine With Bridge
     Execute Command             mach create
     Execute Command             machine LoadPlatformDescription @tests/peripherals/SPI-firmware.repl
     Execute Command             sysbus LoadELF ${FIRMWARE}
-    Execute Command             emulation CreateSPITCPBridge sysbus.spi 0 ${BRIDGE_PORT} false true
+    Execute Command             emulation CreateSPITCPBridge sysbus.spi 0 ${BRIDGE_PORT} true
     Create Terminal Tester      sysbus.uart
     Start Emulation
     Wait For Line On Uart       spi-firmware: ready

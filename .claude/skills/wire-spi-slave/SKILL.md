@@ -51,16 +51,19 @@ private readonly Queue<byte> rxFifo = new Queue<byte>();   // field initializer 
 private readonly object locker = new object();
 ```
 
-**Thread-safety (only if a client/bridge transfers while a CPU runs):** guard shared state touched by both
-`OnTransfer` (socket thread) and firmware register reads (CPU thread) with a `lock`; prefer **polling**
-firmware over cross-thread CPU IRQs. See `InventedSPITarget.cs`.
+**Thread-safety:** the TCP bridge no longer touches the slave from the socket thread — it marshals every
+transfer onto the emulation's time-domain thread (see Step 4), so the bridge and the CPU never drive the
+slave concurrently. A `lock` around shared FIFOs is still good hygiene (register accesses and transfers
+both run on that one thread, but interleaved), and it costs nothing. See `InventedSPITarget.cs`.
 
 ### Firmware-managed slave (memory-mapped + SPI at once)
 
 Also implement `IDoubleWordPeripheral, IKnownSize` and register on **both** the sysbus (MMIO for firmware)
 and the SPI bus. See `InventedSPITarget.cs`: MOSI bytes fill an RX FIFO the firmware drains via
 `ReadDoubleWord`; the firmware pushes a response via `WriteDoubleWord` and, on a commit register write,
-calls `RequestInterrupt(response)` so the master (and TCP bridge) get the answer asynchronously.
+calls `RequestInterrupt(response)`. That interrupt carries the response bytes to the master and the TCP
+bridge (forward-on-interrupt mode) — the SPI answer never rides the command clocks, so the master must
+not busy-poll the bus. This is the deterministic replacement for the old poll-for-response scheme.
 
 ---
 
@@ -118,22 +121,30 @@ spi.slave0 LastReceivedHex                   # DummySPITarget: MOSI bytes of the
 
 ```
 emulation CreateSPITCPBridge sysbus.spi 0 3456                # full-duplex mode (synchronous slave)
-emulation CreateSPITCPBridge sysbus.spi 0 3456 true           # forward-on-interrupt mode (IRQ-pin slave)
-emulation CreateSPITCPBridge sysbus.spi 0 3456 false true     # poll-for-response mode (firmware slave)
+emulation CreateSPITCPBridge sysbus.spi 0 3456 true           # forward-on-interrupt mode (async/firmware slave)
 ```
 
-Because SPI is master-clocked, the slave never pushes — the master only gets bytes back by clocking.
+**Raw in, raw out.** The client sends raw bytes and receives raw bytes — the bridge never adds framing,
+length bytes, or idle-byte filtering. The client (not the bridge) decides how many bytes to clock and
+frames its own protocol.
+
+**Determinism (the whole point).** The bridge does not touch the controller or slave on the host socket
+thread. It marshals every transaction onto the machine's time domain via
+`machine.HandleTimeDomainEvent(..., timeDomainInternalEvent: false)`, so the controller drives the slave
+on the **same simulation clock as the CPU**, never concurrently. A run is reproducible regardless of host
+timing. Consequence: **the emulation must be running** (`start`) for a bridge transfer to execute —
+marshalled work only drains while virtual time advances.
+
 Pick the mode by how the slave produces its answer:
 
-- **Full-duplex (default):** the MISO bytes returned by the same transfer stream straight back —
-  N in, N out. Right for synchronous slaves (`EchoSPIDevice`, register slaves).
-- **Poll-for-response (`false true`):** for a firmware-managed slave (`InventedSPITarget`) that needs CPU
-  time. The bridge clocks the command, then **polls** — clocking a status byte until it reads non-zero
-  (the length) and then clocking out that many response bytes — and forwards them raw to the client. The
-  slave frames the command by chip-select so poll/dummy clocks are not mistaken for command bytes, and
-  gates the response behind a commit so half-written responses are never shifted out.
-- **Forward-on-interrupt (`true`):** models a slave with a side-band IRQ pin that calls `RequestInterrupt`;
-  the payload is forwarded when the interrupt fires (no polling). Not what `InventedSPITarget` uses.
+- **Full-duplex (default):** the MISO bytes returned by the same transfer stream straight back — N in,
+  N out. Right for synchronous slaves (`EchoSPIDevice`, register slaves). For a command/response slave,
+  the client clocks command + read bytes itself and reads the full MISO stream.
+- **Forward-on-interrupt (`true`):** for a slave whose answer needs CPU time (`InventedSPITarget`, a real
+  firmware slave) or that has a side-band IRQ pin. The client sends the command; the bridge clocks it in
+  (returning nothing yet); when the slave calls `RequestInterrupt(payload)`, the raw payload is forwarded
+  to the client. This is the deterministic SPI analog of an I3C IBI, and it replaces the removed
+  poll-for-response mode (host-thread polling could never share the CPU's simulation time).
 
 The Java client (`java-spi/src/spi/SPIBridge.java`) implements exactly `sendData`, `isDataAvailable`,
 `receiveData`. `java-spi/src/spi/Main.java` is a reliability harness; `java-spi/run-integration.sh` drives
@@ -156,5 +167,6 @@ fails on the GStreamer/GirCore packages.)
 2. (Firmware-managed) add `IDoubleWordPeripheral, IKnownSize`, a register map, and lock shared FIFOs.
 3. `.repl`: `SPI.<YourClass> @ spi <cs>` (or `@ { sysbus 0x..; spi <cs> }`), with `SPI.SimpleSPIController @ sysbus 0x..`.
 4. Drive from the monitor with `TransferHex` / interrupt helpers (quote args).
-5. Bridge: `CreateSPITCPBridge` — `true` for a firmware/async slave, default for a synchronous one.
+5. Bridge: `CreateSPITCPBridge` — `true` for a firmware/async slave, default for a synchronous one;
+   then `start` the emulation (transfers are marshalled into the time domain and only run while it does).
 6. Connect the Java client (`sendData`/`isDataAvailable`/`receiveData`); add a robot test.

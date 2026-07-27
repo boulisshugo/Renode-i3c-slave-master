@@ -8,7 +8,6 @@ Library                         ${CURDIR}/SPI-helpers.py
 
 *** Variables ***
 ${BRIDGE_PORT}                  33667
-${STRIP_PORT}                   33672
 
 *** Keywords ***
 Create Machine
@@ -98,6 +97,8 @@ Should Acknowledge Interrupt
 Should Bridge Raw Data Over TCP
     Create Machine
     Execute Command             emulation CreateSPITCPBridge sysbus.spi 0 ${BRIDGE_PORT}
+    # The bridge marshals the transfer into the time domain, so the emulation must be running.
+    Start Emulation
 
     # Queue the bytes the target shifts back on MISO during the exchange.
     Execute Command             spi.slave0 EnqueueResponseBytesHex "01020304"
@@ -107,14 +108,3 @@ Should Bridge Raw Data Over TCP
 
     ${rx}=                      Execute Command  spi.slave0 LastReceivedHex
     Should Contain              ${rx}  [0xDE, 0xAD, 0xBE, 0xEF]
-
-Should Strip Idle 0xFF Bytes When Enabled
-    Create Machine
-    # stripIdleBytes = true: the bridge drops the slave's 0xFF idle/busy filler from the TCP stream.
-    Execute Command             emulation CreateSPITCPBridge sysbus.spi 0 ${STRIP_PORT} false false true
-
-    # The slave shifts back 0xFF filler around a "12EF00" response; only the response should reach TCP.
-    Execute Command             spi.slave0 EnqueueResponseBytesHex "FFFF12EF00FF"
-
-    ${response}=                Transfer Over Spi Bridge  ${STRIP_PORT}  AABBCCDDEEFF  3
-    Should Be Equal             ${response}  12ef00

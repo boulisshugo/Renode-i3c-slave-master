@@ -12,15 +12,20 @@ using Antmicro.Renode.Peripherals.Bus;
 namespace Antmicro.Renode.Peripherals.SPI
 {
     // An "invented" memory-mapped SPI target for firmware-in-the-loop testing, driven by a real
-    // request/response SPI protocol that the master POLLS (SPI slaves cannot push):
+    // request/response protocol whose answer is delivered by an interrupt (SPI slaves cannot push a
+    // response onto the command clocks, so the master must not busy-wait on the bus):
     //
-    //   1. Command phase   - the controller asserts chip select and clocks the command bytes; they land
-    //                        in an RX FIFO. On deassert the target enters PROCESSING.
-    //   2. Processing      - the firmware reads the command from RX, computes a response, writes it to
-    //                        the TX FIFO (a length byte followed by the data), and commits. Poll clocks
-    //                        that arrive meanwhile read back 0x00 (busy) and are NOT buffered.
-    //   3. Response phase  - once committed, poll clocks shift out the TX FIFO: the master reads the
-    //                        length byte (non-zero => ready) and then that many response bytes.
+    //   1. Command phase - the controller asserts chip select and clocks the command bytes; they land in
+    //                      an RX FIFO. On deassert the target enters PROCESSING.
+    //   2. Processing    - the firmware reads the command from RX, computes a response, writes it to the
+    //                      TX FIFO, and commits. On commit the target asserts its data-ready interrupt
+    //                      carrying the response bytes as the payload, then returns to idle.
+    //
+    // Delivering the response by interrupt (instead of having the master poll a status byte) keeps the
+    // whole exchange inside the emulation's time domain: the command arrives on the time-domain thread,
+    // the firmware runs on the CPU, and the commit-driven interrupt fires on that same thread - nothing
+    // depends on host wall-clock polling, so the round-trip is deterministic. The SPITCPBridge forwards
+    // the interrupt payload straight to its TCP client (forward-on-interrupt mode).
     //
     // Registered on both the sysbus (MMIO, for the firmware) and the SPI bus (for the controller).
     public class InventedSPITarget : SimpleSPIPeripheral, IDoubleWordPeripheral, IKnownSize
@@ -60,6 +65,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         public void WriteDoubleWord(long offset, uint value)
         {
+            byte[] response = null;
             switch((Registers)offset)
             {
             case Registers.TxData:
@@ -73,10 +79,18 @@ namespace Antmicro.Renode.Peripherals.SPI
                 {
                     if(state == State.Processing)
                     {
-                        state = State.SendingResponse;
+                        // Snapshot the response and return to idle under the lock; raise the interrupt
+                        // outside it (the interrupt chain reaches the bridge and the host socket).
+                        response = txFifo.ToArray();
+                        txFifo.Clear();
+                        state = State.Idle;
                     }
                 }
-                this.Log(LogLevel.Debug, "Firmware committed a response ({0} bytes incl. length); ready to be polled", CountUnderLock());
+                if(response != null)
+                {
+                    this.Log(LogLevel.Debug, "Firmware committed a {0}-byte response; asserting the data-ready interrupt", response.Length);
+                    RequestInterrupt(response);
+                }
                 break;
             case Registers.Control:
                 if((value & 0x1) != 0)
@@ -92,8 +106,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         public long Size => 0x100;
 
-        // Chip select framing: a command is exactly one CS-asserted transaction; the response is read
-        // back in later (polled) transactions.
+        // Chip select framing: a command is exactly one CS-asserted transaction.
         protected override void OnSelect(bool select)
         {
             lock(locker)
@@ -112,10 +125,6 @@ namespace Antmicro.Renode.Peripherals.SPI
                     {
                         state = rxFifo.Count > 0 ? State.Processing : State.Idle;
                     }
-                    else if(state == State.SendingResponse && txFifo.Count == 0)
-                    {
-                        state = State.Idle;
-                    }
                 }
             }
         }
@@ -124,25 +133,13 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             lock(locker)
             {
-                switch(state)
+                if(state == State.ReceivingCommand)
                 {
-                case State.ReceivingCommand:
                     rxFifo.Enqueue(incoming);
-                    return 0;
-                case State.SendingResponse:
-                    return txFifo.Count > 0 ? txFifo.Dequeue() : (byte)0;
-                default:
-                    // Idle or Processing: busy - poll clocks read back 0 and are not buffered.
-                    return 0;
                 }
-            }
-        }
-
-        private int CountUnderLock()
-        {
-            lock(locker)
-            {
-                return txFifo.Count;
+                // The response never rides the command clocks - it is delivered by interrupt - so MISO is
+                // always idle filler here.
+                return 0;
             }
         }
 
@@ -156,15 +153,14 @@ namespace Antmicro.Renode.Peripherals.SPI
             Idle,
             ReceivingCommand,
             Processing,
-            SendingResponse,
         }
 
         private enum Registers : long
         {
             RxStatus = 0x00, // R: bit0 = command ready to read, bits[15:8] = byte count
             RxData = 0x04,   // R: pop one byte from the RX FIFO
-            TxData = 0x08,   // W: push one response byte into the TX FIFO (length byte first, then data)
-            TxCommit = 0x0C, // W: mark the response ready to be polled
+            TxData = 0x08,   // W: push one response byte into the TX FIFO
+            TxCommit = 0x0C, // W: finalise the response and assert the data-ready interrupt
             Control = 0x10,  // W: bit0 = clear FIFOs and return to idle
         }
     }

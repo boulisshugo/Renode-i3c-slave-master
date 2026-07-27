@@ -254,17 +254,26 @@ Drive it the same way (chip select instead of address):
 ```
 (machine) spi TransferHex 0 "DEADBEEF"                          # full-duplex exchange -> hex MISO
 (machine) emulation CreateSPITCPBridge sysbus.spi 0 3456              # full-duplex bridge
-(machine) emulation CreateSPITCPBridge sysbus.spi 0 3456 false true   # poll-for-response bridge (firmware slave)
+(machine) emulation CreateSPITCPBridge sysbus.spi 0 3456 true         # forward-on-interrupt bridge (firmware/async slave)
+(machine) start                                                       # transfers run in the time domain
 ```
 
 Verified end-to-end, Java → bridge → controller → firmware-managed SPI slave → back: **100% reliability**
-over 1000+ round-trips (16–250 bytes, avg ~1.3 ms). All SPI robot suites pass.
+over 1000+ round-trips (16–250 bytes). All SPI robot suites pass.
+
+**Raw in, raw out, and deterministic.** The TCP client sends raw bytes and receives raw bytes — the
+bridge adds no framing, length bytes, or idle-byte filtering. Crucially, the bridge never drives the
+controller or slave from its host socket thread: it marshals every transaction onto the machine's time
+domain (`machine.HandleTimeDomainEvent(..., timeDomainInternalEvent: false)`), so the **controller and
+slave run on the same simulation clock as the CPU**, never concurrently with it. A run is reproducible
+regardless of host timing — which is why the emulation must be running (`start`) for a bridge transfer to
+execute.
 
 **How the master gets a firmware slave's response.** SPI is master-clocked, so the slave can never push —
-the master only receives bytes by clocking. For a firmware-managed slave the response isn't ready within
-the command transfer, so the bridge **polls**: it clocks the command, then clocks a status byte until it
-reads non-zero (the response length) and clocks out that many bytes, forwarding them raw to the client.
-The `InventedSPITarget` frames the command by chip-select (so poll/dummy clocks are not mistaken for
-command bytes) and gates the response behind a commit (so a half-written response is never shifted out).
-The three bridge modes — full-duplex, poll-for-response, and forward-on-interrupt (a side-band IRQ pin) —
-cover the ways a slave can hand back data.
+the master only receives bytes by clocking. For a synchronous slave the answer rides the same clocks
+(full-duplex, N in → N out). For a firmware-managed slave the answer isn't ready within the command
+transfer, so the slave delivers it by asserting its **data-ready interrupt** carrying the response bytes;
+the bridge forwards that raw payload to the client (forward-on-interrupt mode). This is the deterministic
+SPI analog of an I3C IBI, and it replaces host-thread polling — which could never share the CPU's
+simulation time. The `InventedSPITarget` frames the command by chip-select and gates the response behind
+a commit (which fires the interrupt), so a half-written response is never shifted out.

@@ -18,6 +18,8 @@ Create Machine
 Create Machine With Bridge
     Create Machine
     Execute Command             emulation CreateSPITCPBridge sysbus.spi 0 ${BRIDGE_PORT}
+    # The bridge marshals every transfer into the time domain, so the emulation must be running.
+    Start Emulation
 
 *** Test Cases ***
 # --------------------------------------------------------------------------------------------------
