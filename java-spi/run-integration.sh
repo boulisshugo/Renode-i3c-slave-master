@@ -32,7 +32,7 @@ using sysbus
 mach create
 machine LoadPlatformDescription @$REPL
 sysbus LoadELF @$ELF
-emulation CreateSPITCPBridge sysbus.spi 0 $PORT true
+emulation CreateSPITCPBridge sysbus.spi 0 $PORT false true
 start
 EOF
 

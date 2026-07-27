@@ -117,15 +117,23 @@ spi.slave0 LastReceivedHex                   # DummySPITarget: MOSI bytes of the
 ## Step 4 — Connect a Java (or other) client via the TCP bridge
 
 ```
-emulation CreateSPITCPBridge sysbus.spi 0 3456          # full-duplex mode (synchronous slave)
-emulation CreateSPITCPBridge sysbus.spi 0 3456 true     # forward-on-interrupt mode (firmware/async slave)
+emulation CreateSPITCPBridge sysbus.spi 0 3456                # full-duplex mode (synchronous slave)
+emulation CreateSPITCPBridge sysbus.spi 0 3456 true           # forward-on-interrupt mode (IRQ-pin slave)
+emulation CreateSPITCPBridge sysbus.spi 0 3456 false true     # poll-for-response mode (firmware slave)
 ```
 
-- **Full-duplex (default):** bytes from TCP are clocked to the target and the MISO bytes of the same
-  transfer stream straight back — N in, N out. Right for synchronous slaves (`EchoSPIDevice`, register slaves).
-- **Forward-on-interrupt (`true`):** bytes from TCP are clocked in, but the response arrives later, when
-  the target asserts its interrupt line — required for a firmware-managed slave, which can't answer while
-  the CPU is mid-quantum. Match it with a **polling** client.
+Because SPI is master-clocked, the slave never pushes — the master only gets bytes back by clocking.
+Pick the mode by how the slave produces its answer:
+
+- **Full-duplex (default):** the MISO bytes returned by the same transfer stream straight back —
+  N in, N out. Right for synchronous slaves (`EchoSPIDevice`, register slaves).
+- **Poll-for-response (`false true`):** for a firmware-managed slave (`InventedSPITarget`) that needs CPU
+  time. The bridge clocks the command, then **polls** — clocking a status byte until it reads non-zero
+  (the length) and then clocking out that many response bytes — and forwards them raw to the client. The
+  slave frames the command by chip-select so poll/dummy clocks are not mistaken for command bytes, and
+  gates the response behind a commit so half-written responses are never shifted out.
+- **Forward-on-interrupt (`true`):** models a slave with a side-band IRQ pin that calls `RequestInterrupt`;
+  the payload is forwarded when the interrupt fires (no polling). Not what `InventedSPITarget` uses.
 
 The Java client (`java-spi/src/spi/SPIBridge.java`) implements exactly `sendData`, `isDataAvailable`,
 `receiveData`. `java-spi/src/spi/Main.java` is a reliability harness; `java-spi/run-integration.sh` drives

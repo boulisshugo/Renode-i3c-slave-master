@@ -22,6 +22,8 @@ namespace Antmicro.Renode.Peripherals.SPI
     // on any SPI controller (repl: `slave: Mocks.DummySPITarget @ spi 0`). Transfers are driven at the
     // transaction level from a C# test-bench or from the monitor / robot tests:
     //   - Transfer / TransferHex perform a full-duplex exchange with the selected target,
+    //   - Select / Transmit / Deselect expose the primitives for a manual, held-chip-select loop (used
+    //     to poll a slave for a response it produces asynchronously),
     //   - a target's data-ready interrupt (for targets built on SimpleSPIPeripheral) is captured and
     //     drives the IRQ GPIO line.
     //
@@ -74,8 +76,37 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
         }
 
-        // Full-duplex SPI transaction with the target at the given chip select: clocks out each byte of
-        // data and returns the MISO byte received for it, then deasserts chip select. Returns the
+        // Assert chip select for the given target. If the target implements ISelectableSPIPeripheral,
+        // its Select(true) is called so it can react to NSS assertion.
+        public void Select(int chipSelect)
+        {
+            if(!TryGetTarget(chipSelect, out var target))
+            {
+                return;
+            }
+            if(target is ISelectableSPIPeripheral sel)
+            {
+                sel.Select(true);
+            }
+        }
+
+        // De-assert chip select for the given target. If the target implements ISelectableSPIPeripheral,
+        // its Select(false) is called; FinishTransmission is always called.
+        public void Deselect(int chipSelect)
+        {
+            if(!TryGetTarget(chipSelect, out var target))
+            {
+                return;
+            }
+            if(target is ISelectableSPIPeripheral sel)
+            {
+                sel.Select(false);
+            }
+            target.FinishTransmission();
+        }
+
+        // Full-duplex SPI transaction with the target at the given chip select: asserts chip select,
+        // clocks out each byte of data, returns the MISO bytes, then deasserts chip select. Returns the
         // received bytes (one per byte sent).
         public byte[] Transfer(int chipSelect, byte[] data)
         {
@@ -83,13 +114,25 @@ namespace Antmicro.Renode.Peripherals.SPI
             {
                 return new byte[0];
             }
+            Select(chipSelect);
             var result = new byte[data.Length];
             for(var i = 0; i < data.Length; i++)
             {
                 result[i] = target.Transmit(data[i]);
             }
-            target.FinishTransmission();
+            Deselect(chipSelect);
             return result;
+        }
+
+        // Clock a single byte to the selected target without managing chip select. Use this inside a
+        // polling loop: Select(cs), then send command + dummy bytes via Transmit, then Deselect(cs).
+        public byte Transmit(int chipSelect, byte data)
+        {
+            if(!TryGetTarget(chipSelect, out var target))
+            {
+                return 0xFF;
+            }
+            return target.Transmit(data);
         }
 
         // Monitor-friendly helper: full-duplex transfer of hex-encoded data, returning hex-encoded MISO.

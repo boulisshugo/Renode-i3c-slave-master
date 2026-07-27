@@ -1,10 +1,10 @@
 /*
  * Tiny bare-metal "OS" for the firmware-managed SPI slave.
  *
- * It drives the invented SPI target peripheral (SPI.InventedSPITarget): it polls the RX FIFO for
- * bytes clocked in by the SPI controller, echoes them into the TX FIFO, and commits the response -
- * which the target turns into an interrupt carrying the bytes back to the controller (and, through
- * the TCP bridge, back to the external client).
+ * It drives the invented SPI target peripheral (SPI.InventedSPITarget). SPI slaves cannot push, so the
+ * response is delivered by having the master poll: the firmware reads the command from the RX FIFO,
+ * then writes a length-prefixed response into the TX FIFO ([N, byte0..byteN-1]) and commits it. The
+ * master then clocks a status byte until it reads N (ready), and clocks out the N response bytes.
  */
 #include <stdint.h>
 
@@ -27,19 +27,26 @@ static void uart_puts(const char *s)
 
 int main(void)
 {
+    static uint8_t buf[256];
+
     uart_puts("spi-firmware: ready\n");
 
     for(;;)
     {
         if(SPI_RX_STATUS & 1u)
         {
-            /* Drain every byte currently available and echo it into the TX FIFO. */
-            while(SPI_RX_STATUS & 1u)
+            /* Drain the whole command from the RX FIFO. */
+            uint32_t n = 0;
+            while((SPI_RX_STATUS & 1u) && n < sizeof(buf))
             {
-                uint8_t b = (uint8_t)SPI_RX_DATA;
-                SPI_TX_DATA = b;
+                buf[n++] = (uint8_t)SPI_RX_DATA;
             }
-            /* Hand the response back to the controller via the interrupt line. */
+            /* Write a length-prefixed echo response and commit it for the master to poll. */
+            SPI_TX_DATA = (uint8_t)n;
+            for(uint32_t i = 0; i < n; i++)
+            {
+                SPI_TX_DATA = buf[i];
+            }
             SPI_TX_COMMIT = 1u;
             uart_puts("spi-firmware: echoed a message\n");
         }

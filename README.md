@@ -252,14 +252,19 @@ the slave→master signal is a side-band **data-ready interrupt** (the analog of
 Drive it the same way (chip select instead of address):
 
 ```
-(machine) spi TransferHex 0 "DEADBEEF"                 # full-duplex exchange -> hex MISO
-(machine) emulation CreateSPITCPBridge sysbus.spi 0 3456        # full-duplex bridge
-(machine) emulation CreateSPITCPBridge sysbus.spi 0 3456 true   # forward-on-interrupt bridge (firmware slave)
+(machine) spi TransferHex 0 "DEADBEEF"                          # full-duplex exchange -> hex MISO
+(machine) emulation CreateSPITCPBridge sysbus.spi 0 3456              # full-duplex bridge
+(machine) emulation CreateSPITCPBridge sysbus.spi 0 3456 false true   # poll-for-response bridge (firmware slave)
 ```
 
 Verified end-to-end, Java → bridge → controller → firmware-managed SPI slave → back: **100% reliability**
 over 1000+ round-trips (16–250 bytes, avg ~1.3 ms). All SPI robot suites pass.
 
-One SPI-specific subtlety worth noting: in the firmware-managed target, MISO stays 0 during the command
-phase and the response is delivered only via the interrupt — otherwise the controller's ongoing full-duplex
-clocks could consume the firmware's response bytes as discarded MISO before the interrupt fires.
+**How the master gets a firmware slave's response.** SPI is master-clocked, so the slave can never push —
+the master only receives bytes by clocking. For a firmware-managed slave the response isn't ready within
+the command transfer, so the bridge **polls**: it clocks the command, then clocks a status byte until it
+reads non-zero (the response length) and clocks out that many bytes, forwarding them raw to the client.
+The `InventedSPITarget` frames the command by chip-select (so poll/dummy clocks are not mistaken for
+command bytes) and gates the response behind a commit (so a half-written response is never shifted out).
+The three bridge modes — full-duplex, poll-for-response, and forward-on-interrupt (a side-band IRQ pin) —
+cover the ways a slave can hand back data.

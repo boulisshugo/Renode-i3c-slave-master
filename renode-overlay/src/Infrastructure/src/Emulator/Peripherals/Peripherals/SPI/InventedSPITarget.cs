@@ -11,17 +11,18 @@ using Antmicro.Renode.Peripherals.Bus;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
-    // An "invented" memory-mapped SPI target for firmware-in-the-loop testing.
+    // An "invented" memory-mapped SPI target for firmware-in-the-loop testing, driven by a real
+    // request/response SPI protocol that the master POLLS (SPI slaves cannot push):
     //
-    // On the SPI bus it is an ISPIPeripheral (via SimpleSPIPeripheral); on the sysbus it exposes a
-    // small register interface that a CPU firmware polls:
-    //   - MOSI bytes clocked in by the controller land in an RX FIFO the firmware reads out,
-    //   - the firmware pushes a response into a TX FIFO and commits it,
-    //   - on commit the target asserts its interrupt line carrying the response, so the controller
-    //     (and, through it, the TCP bridge) receives the firmware's answer.
+    //   1. Command phase   - the controller asserts chip select and clocks the command bytes; they land
+    //                        in an RX FIFO. On deassert the target enters PROCESSING.
+    //   2. Processing      - the firmware reads the command from RX, computes a response, writes it to
+    //                        the TX FIFO (a length byte followed by the data), and commits. Poll clocks
+    //                        that arrive meanwhile read back 0x00 (busy) and are NOT buffered.
+    //   3. Response phase  - once committed, poll clocks shift out the TX FIFO: the master reads the
+    //                        length byte (non-zero => ready) and then that many response bytes.
     //
-    // This makes the "slave" genuinely firmware-managed: the controller clocks data to it, the emulated
-    // firmware processes that data, and its response travels back over the same path.
+    // Registered on both the sysbus (MMIO, for the firmware) and the SPI bus (for the controller).
     public class InventedSPITarget : SimpleSPIPeripheral, IDoubleWordPeripheral, IKnownSize
     {
         public override void Reset()
@@ -31,6 +32,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             {
                 rxFifo.Clear();
                 txFifo.Clear();
+                state = State.Idle;
             }
         }
 
@@ -41,18 +43,14 @@ namespace Antmicro.Renode.Peripherals.SPI
             case Registers.RxStatus:
                 lock(locker)
                 {
-                    var count = (uint)rxFifo.Count;
-                    return (count > 0 ? 1u : 0u) | (count << 8);
+                    // The command is readable only once fully received (chip select deasserted).
+                    var available = state == State.Processing && rxFifo.Count > 0;
+                    return (available ? 1u : 0u) | ((uint)rxFifo.Count << 8);
                 }
             case Registers.RxData:
                 lock(locker)
                 {
                     return rxFifo.Count > 0 ? rxFifo.Dequeue() : 0u;
-                }
-            case Registers.TxStatus:
-                lock(locker)
-                {
-                    return (uint)txFifo.Count << 8;
                 }
             default:
                 this.Log(LogLevel.Warning, "Read from an unhandled register 0x{0:X}", offset);
@@ -71,7 +69,14 @@ namespace Antmicro.Renode.Peripherals.SPI
                 }
                 break;
             case Registers.TxCommit:
-                CommitResponse();
+                lock(locker)
+                {
+                    if(state == State.Processing)
+                    {
+                        state = State.SendingResponse;
+                    }
+                }
+                this.Log(LogLevel.Debug, "Firmware committed a response ({0} bytes incl. length); ready to be polled", CountUnderLock());
                 break;
             case Registers.Control:
                 if((value & 0x1) != 0)
@@ -87,44 +92,80 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         public long Size => 0x100;
 
-        // The incoming MOSI byte goes to the RX FIFO for the firmware. MISO stays 0 during the command
-        // phase: the firmware's response is delivered out-of-band via the interrupt on commit, NOT
-        // shifted out here. (Shifting the TX FIFO out here would let the controller's ongoing RX clocks
-        // consume the firmware's response bytes as discarded MISO when the two overlap.)
+        // Chip select framing: a command is exactly one CS-asserted transaction; the response is read
+        // back in later (polled) transactions.
+        protected override void OnSelect(bool select)
+        {
+            lock(locker)
+            {
+                if(select)
+                {
+                    if(state == State.Idle)
+                    {
+                        state = State.ReceivingCommand;
+                        rxFifo.Clear();
+                    }
+                }
+                else
+                {
+                    if(state == State.ReceivingCommand)
+                    {
+                        state = rxFifo.Count > 0 ? State.Processing : State.Idle;
+                    }
+                    else if(state == State.SendingResponse && txFifo.Count == 0)
+                    {
+                        state = State.Idle;
+                    }
+                }
+            }
+        }
+
         protected override byte OnTransfer(byte incoming)
         {
             lock(locker)
             {
-                rxFifo.Enqueue(incoming);
+                switch(state)
+                {
+                case State.ReceivingCommand:
+                    rxFifo.Enqueue(incoming);
+                    return 0;
+                case State.SendingResponse:
+                    return txFifo.Count > 0 ? txFifo.Dequeue() : (byte)0;
+                default:
+                    // Idle or Processing: busy - poll clocks read back 0 and are not buffered.
+                    return 0;
+                }
             }
-            return 0;
         }
 
-        private void CommitResponse()
+        private int CountUnderLock()
         {
-            byte[] response;
             lock(locker)
             {
-                response = txFifo.ToArray();
-                txFifo.Clear();
+                return txFifo.Count;
             }
-            this.Log(LogLevel.Debug, "Firmware committed a {0}-byte response, asserting the interrupt line", response.Length);
-            RequestInterrupt(response);
         }
 
-        // Field initializers (run before the base constructor, which calls the virtual Reset()).
         private readonly Queue<byte> rxFifo = new Queue<byte>();
         private readonly Queue<byte> txFifo = new Queue<byte>();
         private readonly object locker = new object();
+        private State state = State.Idle;
+
+        private enum State
+        {
+            Idle,
+            ReceivingCommand,
+            Processing,
+            SendingResponse,
+        }
 
         private enum Registers : long
         {
-            RxStatus = 0x00, // R: bit0 = RX data available, bits[15:8] = byte count
+            RxStatus = 0x00, // R: bit0 = command ready to read, bits[15:8] = byte count
             RxData = 0x04,   // R: pop one byte from the RX FIFO
-            TxData = 0x08,   // W: push one byte into the TX FIFO
-            TxCommit = 0x0C, // W: finalise the response (asserts the interrupt line with the TX bytes)
-            Control = 0x10,  // W: bit0 = clear both FIFOs
-            TxStatus = 0x14, // R: bits[15:8] = pending TX byte count
+            TxData = 0x08,   // W: push one response byte into the TX FIFO (length byte first, then data)
+            TxCommit = 0x0C, // W: mark the response ready to be polled
+            Control = 0x10,  // W: bit0 = clear FIFOs and return to idle
         }
     }
 }

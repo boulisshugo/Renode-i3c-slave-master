@@ -19,7 +19,7 @@ namespace Antmicro.Renode.Peripherals.SPI
     // this class returns bytes queued with EnqueueResponseBytes (zeros once empty); subclass it and
     // override OnTransfer for proprietary behaviour, and call RequestInterrupt to raise the target's
     // data-ready / interrupt line towards the controller (the SPI side-band analog of an I3C IBI).
-    public class SimpleSPIPeripheral : ISPIPeripheral
+    public class SimpleSPIPeripheral : ISelectableSPIPeripheral
     {
         public SimpleSPIPeripheral()
         {
@@ -42,6 +42,13 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             this.Log(LogLevel.Noisy, "Chip select deasserted (transmission finished)");
             OnFinishTransmission();
+        }
+
+        // Implements ISelectableSPIPeripheral: the controller calls this on chip-select assert/deassert.
+        public void Select(bool select)
+        {
+            this.Log(LogLevel.Noisy, "Chip select {0}", select ? "asserted" : "deasserted");
+            OnSelect(select);
         }
 
         // Queues a byte to be shifted out (MISO) on subsequent transfers.
@@ -78,6 +85,12 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         // Called when the controller deasserts chip select. Default: no-op.
         protected virtual void OnFinishTransmission()
+        {
+        }
+
+        // Called on chip-select assert (true) / deassert (false). Default: no-op. Override to frame a
+        // transaction (e.g. distinguish a command phase from a polled response phase).
+        protected virtual void OnSelect(bool select)
         {
         }
 

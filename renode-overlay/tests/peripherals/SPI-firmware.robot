@@ -16,8 +16,8 @@ Create Machine
     Execute Command             mach create
     Execute Command             machine LoadPlatformDescription @tests/peripherals/SPI-firmware.repl
     Execute Command             sysbus LoadELF ${FIRMWARE}
-    # forward-on-interrupt mode: the firmware's response arrives via the target's interrupt line.
-    Execute Command             emulation CreateSPITCPBridge sysbus.spi 0 ${BRIDGE_PORT} true
+    # poll-for-response mode: the master polls the slave for the firmware's length-prefixed response.
+    Execute Command             emulation CreateSPITCPBridge sysbus.spi 0 ${BRIDGE_PORT} false true
 
 *** Test Cases ***
 Should Boot The Firmware
