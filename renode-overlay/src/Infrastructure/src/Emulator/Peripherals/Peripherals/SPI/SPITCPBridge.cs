@@ -5,6 +5,7 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Linq;
 using System.Threading;
 
 using Antmicro.Migrant;
@@ -20,9 +21,10 @@ namespace Antmicro.Renode.Peripherals.SPI
         // Creates a raw TCP bridge to a target on a SimpleSPIController.
         //
         // Monitor usage:
-        //   emulation CreateSPITCPBridge sysbus.spi 0 3456                   # full-duplex mode
-        //   emulation CreateSPITCPBridge sysbus.spi 0 3456 true             # forward-on-interrupt mode
-        //   emulation CreateSPITCPBridge sysbus.spi 0 3456 false true       # poll-for-response mode
+        //   emulation CreateSPITCPBridge sysbus.spi 0 3456                       # full-duplex mode
+        //   emulation CreateSPITCPBridge sysbus.spi 0 3456 true                  # forward-on-interrupt mode
+        //   emulation CreateSPITCPBridge sysbus.spi 0 3456 false true            # poll-for-response mode
+        //   emulation CreateSPITCPBridge sysbus.spi 0 3456 false false true      # full-duplex, strip 0xFF idle
         //
         // - full-duplex: the MISO bytes returned by the same transfer are streamed back (synchronous
         //   slaves).
@@ -31,31 +33,37 @@ namespace Antmicro.Renode.Peripherals.SPI
         // - poll-for-response: after clocking the command, the master POLLS the slave (SPI slaves cannot
         //   push) - clocking a status byte until it becomes non-zero (the length), then clocking out
         //   that many response bytes. This is the right mode for the firmware-managed InventedSPITarget.
+        //
+        // stripIdleBytes: when true, the bridge drops the slave's idle/busy filler bytes (0xFF by
+        // default, see SPITCPBridge.IdleByte) from what it forwards to the client, so the client sees
+        // only the bytes the slave actually drove. Leave it off (the default) for binary-clean transfers
+        // where 0xFF is legitimate data.
         public static void CreateSPITCPBridge(this Emulation emulation, SimpleSPIController controller,
             int chipSelect, int port, bool forwardOnInterrupt = false, bool pollForResponse = false,
-            string name = "spiBridge")
+            bool stripIdleBytes = false, string name = "spiBridge")
         {
             if(port < 0 || port > 65535)
             {
                 throw new RecoverableException("Port must be between 0 and 65535");
             }
             emulation.ExternalsManager.AddExternal(
-                new SPITCPBridge(controller, chipSelect, port, forwardOnInterrupt, pollForResponse), name);
+                new SPITCPBridge(controller, chipSelect, port, forwardOnInterrupt, pollForResponse, stripIdleBytes), name);
         }
     }
 
     // Bridges a single target on a SimpleSPIController to a raw TCP socket. See CreateSPITCPBridge for
-    // the three response-delivery modes.
+    // the response-delivery modes and the idle-byte stripping option.
     [Transient]
     public class SPITCPBridge : IExternal, IDisposable
     {
         public SPITCPBridge(SimpleSPIController controller, int chipSelect, int port,
-            bool forwardOnInterrupt = false, bool pollForResponse = false)
+            bool forwardOnInterrupt = false, bool pollForResponse = false, bool stripIdleBytes = false)
         {
             this.controller = controller;
             this.chipSelect = chipSelect;
             this.forwardOnInterrupt = forwardOnInterrupt;
             this.pollForResponse = pollForResponse;
+            StripIdleBytes = stripIdleBytes;
 
             server = new SocketServerProvider(telnetMode: false, serverName: "SPIBridge");
             // Read up to a full chunk per recv so a message is delivered as one block, not byte-by-byte.
@@ -78,8 +86,9 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
 
             server.Start(port);
-            this.Log(LogLevel.Info, "SPI TCP bridge for chip select {0} listening on port {1} ({2})",
-                chipSelect, port, forwardOnInterrupt ? "forward-on-interrupt" : (pollForResponse ? "poll-for-response" : "full-duplex"));
+            this.Log(LogLevel.Info, "SPI TCP bridge for chip select {0} listening on port {1} ({2}{3})",
+                chipSelect, port, forwardOnInterrupt ? "forward-on-interrupt" : (pollForResponse ? "poll-for-response" : "full-duplex"),
+                StripIdleBytes ? ", stripping idle bytes" : "");
         }
 
         public void Dispose()
@@ -94,6 +103,13 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         // Max time to poll a firmware-managed slave for its response.
         public int PollTimeoutMilliseconds { get; set; } = 5000;
+
+        // When true, IdleByte values are removed from the bytes forwarded to the TCP client.
+        public bool StripIdleBytes { get; set; }
+
+        // The slave's idle/busy MISO value to drop when StripIdleBytes is set. SPI MISO idles high, so
+        // this is 0xFF by default.
+        public byte IdleByte { get; set; } = 0xFF;
 
         private void HandleDataReceived(byte[] data)
         {
@@ -117,12 +133,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 // The response arrives asynchronously via the target's interrupt line.
                 return;
             }
-            if(response != null && response.Length > 0)
-            {
-                this.Log(LogLevel.Debug, "Bridge forwarding {0} MISO bytes to TCP: {1}",
-                    response.Length, Misc.PrettyPrintCollectionHex(response));
-                server.Send(response);
-            }
+            ForwardToClient(response);
         }
 
         private void PollForResponse(byte[] command)
@@ -159,9 +170,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 {
                     response[i] = controller.Transmit(chipSelect, 0x00);
                 }
-                this.Log(LogLevel.Debug, "Bridge forwarding {0} polled bytes to TCP: {1}",
-                    response.Length, Misc.PrettyPrintCollectionHex(response));
-                server.Send(response);
+                ForwardToClient(response);
             }
             finally
             {
@@ -171,13 +180,27 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private void HandleInterrupt(ISPIPeripheral source, byte[] payload)
         {
-            if(payload == null || payload.Length == 0)
+            ForwardToClient(payload);
+        }
+
+        // Sends bytes to the connected TCP client, optionally dropping the slave's idle/busy filler.
+        private void ForwardToClient(byte[] data)
+        {
+            if(data == null || data.Length == 0)
             {
                 return;
             }
-            this.Log(LogLevel.Debug, "Bridge forwarding {0} bytes from an interrupt of chip select {1} to TCP: {2}",
-                payload.Length, chipSelect, Misc.PrettyPrintCollectionHex(payload));
-            server.Send(payload);
+            if(StripIdleBytes)
+            {
+                data = data.Where(b => b != IdleByte).ToArray();
+                if(data.Length == 0)
+                {
+                    return;
+                }
+            }
+            this.Log(LogLevel.Debug, "Bridge forwarding {0} bytes to TCP: {1}",
+                data.Length, Misc.PrettyPrintCollectionHex(data));
+            server.Send(data);
         }
 
         private readonly SocketServerProvider server;
