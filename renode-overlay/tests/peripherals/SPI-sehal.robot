@@ -4,6 +4,10 @@ Suite Teardown                  Teardown
 Test Setup                      Reset Emulation
 Test Teardown                   Test Teardown
 Resource                        ${RENODEKEYWORDS}
+Library                         ${CURDIR}/SPI-helpers.py
+
+*** Variables ***
+${BRIDGE_PORT}                  33673
 
 *** Keywords ***
 Create Machine
@@ -72,3 +76,18 @@ Should Reject A Transfer While A Receive Is In Progress
     Wait Until Keyword Succeeds  20x  0.1s  Receive Should Be Done
     ${block}=                   Execute Command  spi LastReceivedBlockHex
     Should Contain              ${block}  [0x33, 0x0, 0x2, 0x12, 0x34]
+
+# End-to-end over TCP: the client sends the raw command and receives ONLY the raw response block
+# (NAD + PCB + LEN + payload/CRC) - no idle bytes, no extra framing added by the bridge.
+Should Deliver Only The Raw Block To A TCP Client
+    Create Machine
+    Execute Command             spi.se CommandLength 5
+    Execute Command             spi.se NotReadyPolls 3
+    Execute Command             spi.se SetResponseBlockHex "2100039000AB"
+    # The bridge auto-detects the SpiControllerSeHal and forwards its BlockReceived event.
+    Execute Command             emulation CreateSPITCPBridge sysbus.spi 0 ${BRIDGE_PORT}
+    Start Emulation
+
+    # Send a 5-byte command; expect exactly the 6-byte block back.
+    ${response}=                Transfer Over Spi Bridge  ${BRIDGE_PORT}  0011223344  6  timeout=5
+    Should Be Equal             ${response}  2100039000ab

@@ -74,7 +74,15 @@ namespace Antmicro.Renode.Peripherals.SPI
             server.ConnectionClosed += () => this.Log(LogLevel.Info, "TCP client disconnected from the SPI bridge");
             server.DataBlockReceived += HandleDataReceived;
 
-            if(forwardOnInterrupt)
+            // A SpiControllerSeHal does the send synchronously but delivers the polled response block
+            // asynchronously via its BlockReceived event (not as the Transfer return value), so subscribe
+            // to that and forward the raw block. This takes precedence over the target-interrupt path.
+            seHalController = controller as SpiControllerSeHal;
+            if(seHalController != null)
+            {
+                seHalController.BlockReceived += HandleBlockReceived;
+            }
+            else if(forwardOnInterrupt)
             {
                 target = controller.GetTarget(chipSelect) as SimpleSPIPeripheral;
                 if(target != null)
@@ -88,8 +96,10 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
 
             server.Start(port);
+            var mode = seHalController != null ? "poll-and-forward-block"
+                : (forwardOnInterrupt ? "forward-on-interrupt" : "full-duplex");
             this.Log(LogLevel.Info, "SPI TCP bridge for chip select {0} listening on port {1} ({2})",
-                chipSelect, port, forwardOnInterrupt ? "forward-on-interrupt" : "full-duplex");
+                chipSelect, port, mode);
         }
 
         public void Dispose()
@@ -98,6 +108,10 @@ namespace Antmicro.Renode.Peripherals.SPI
             if(target != null)
             {
                 target.InterruptRequested -= HandleInterrupt;
+            }
+            if(seHalController != null)
+            {
+                seHalController.BlockReceived -= HandleBlockReceived;
             }
             server.Stop();
         }
@@ -127,6 +141,12 @@ namespace Antmicro.Renode.Peripherals.SPI
         private void DriveTransfer(byte[] data)
         {
             var miso = controller.Transfer(chipSelect, data);
+            if(seHalController != null)
+            {
+                // SpiControllerSeHal sent the command; the response block arrives later on the clock
+                // thread via BlockReceived (see HandleBlockReceived). Nothing to forward now.
+                return;
+            }
             if(forwardOnInterrupt)
             {
                 // The response is delivered later, when the slave asserts its data-ready line (see
@@ -141,6 +161,13 @@ namespace Antmicro.Renode.Peripherals.SPI
         private void HandleInterrupt(ISPIPeripheral source, byte[] payload)
         {
             ForwardToClient(payload);
+        }
+
+        // Fired on the clock thread when a SpiControllerSeHal has polled a full response block out of the
+        // SE. The block is the raw framed answer (NAD, PCB, LEN, payload+CRC) - forward it as-is.
+        private void HandleBlockReceived(byte[] block)
+        {
+            ForwardToClient(block);
         }
 
         // Sends raw bytes to the connected TCP client, exactly as the slave drove them.
@@ -158,6 +185,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private readonly IMachine machine;
         private readonly SocketServerProvider server;
         private readonly SimpleSPIController controller;
+        private readonly SpiControllerSeHal seHalController;
         private readonly SimpleSPIPeripheral target;
         private readonly int chipSelect;
         private readonly bool forwardOnInterrupt;
