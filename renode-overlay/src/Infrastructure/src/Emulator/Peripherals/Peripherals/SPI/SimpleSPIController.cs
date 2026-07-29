@@ -108,7 +108,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         // Full-duplex SPI transaction with the target at the given chip select: asserts chip select,
         // clocks out each byte of data, returns the MISO bytes, then deasserts chip select. Returns the
         // received bytes (one per byte sent).
-        public byte[] Transfer(int chipSelect, byte[] data)
+        public virtual byte[] Transfer(int chipSelect, byte[] data)
         {
             if(!TryGetTarget(chipSelect, out var target))
             {
@@ -164,7 +164,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             return TryGetByAddress(chipSelect, out var target) ? target : null;
         }
 
-        private bool TryGetTarget(int chipSelect, out ISPIPeripheral target)
+        protected bool TryGetTarget(int chipSelect, out ISPIPeripheral target)
         {
             if(!TryGetByAddress(chipSelect, out target))
             {
