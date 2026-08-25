@@ -61,7 +61,9 @@ The SPI suites (`SPI*.robot`) mirror these one-to-one. The SWP suites cover the 
 bad-CRC rejection), the ACT activation sequence, SHDLC link establishment and window negotiation,
 sequenced transfer across the modulo-8 wrap, line isolation, unsolicited UICC frames and deactivation;
 `SWP-consistency.robot` checks byte-for-byte integrity for large payloads and for payloads that imitate
-the SOF/EOF flags, over both the direct API and the TCP bridge.
+the SOF/EOF flags, over both the direct API and the TCP bridge. `tools/swp-selftest/run.sh` additionally
+drives the SWP models through every protocol scenario in a couple of seconds without a Renode checkout
+(see [Self-test](#self-test-without-a-renode-checkout)).
 
 ## The `II3CPeripheral` contract
 
@@ -307,6 +309,7 @@ SWP's behaviour actually lives, so a model that skipped it would not be modellin
 | `Mocks/DummySWPTarget.cs` | Ready-to-use mock UICC (records payloads, transmits unprompted). |
 | `Mocks/EchoSWPDevice.cs` | Mock UICC that echoes each payload back (for consistency testing). |
 | `tests/peripherals/SWP*.robot` | Robot suites: per-feature and data consistency. |
+| `tools/swp-selftest/` | Stub-compiled self-test: the protocol scenarios in seconds, no Renode checkout. |
 
 ### The three layers
 
@@ -430,6 +433,22 @@ namespace Antmicro.Renode.Peripherals.SWP
     }
 }
 ```
+
+### Self-test without a Renode checkout
+
+The robot suites need Renode built. For a fast check of the protocol logic alone:
+
+```bash
+apt-get install -y mono-mcs mono-runtime     # once
+./tools/swp-selftest/run.sh
+```
+
+It compiles the real SWP sources against a small set of Renode API stubs and runs the CLF and UICC
+through the data link layer, activation, SHDLC and every error-recovery path — golden wire vectors, a
+3200-payload codec fuzz, 200 sequenced round-trips across the modulo-8 wrap, window negotiation,
+out-of-sequence REJ recovery, corrupted frames, a mute UICC and a lost `ACT_READY` recovered by FR. It
+type-checks the sources too, so it catches a compile break early. It does **not** exercise Renode
+itself, the `.repl` loader or the monitor — that is what the robot suites are for.
 
 ### Standards fidelity
 

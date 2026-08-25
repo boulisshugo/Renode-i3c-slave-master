@@ -58,7 +58,7 @@ namespace Antmicro.Renode.Peripherals.SWP
 
         // The CLF starts driving S1. The UICC signals that it is ready to communicate by sending the
         // first ACT_SYNC frame, carrying its ACT_INFORMATION capabilities.
-        public byte[] Activate()
+        public virtual byte[] Activate()
         {
             lock(locker)
             {
@@ -73,7 +73,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         }
 
         // The CLF drives S1 low. The interface is unpowered and keeps no state.
-        public void Deactivate()
+        public virtual void Deactivate()
         {
             lock(locker)
             {
@@ -89,7 +89,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         }
 
         // One full-duplex frame slot: the CLF's frame arrives on S1, the UICC's answer leaves on S2.
-        public byte[] ExchangeFrame(byte[] wireFrame)
+        public virtual byte[] ExchangeFrame(byte[] wireFrame)
         {
             lock(locker)
             {

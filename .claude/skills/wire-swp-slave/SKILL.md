@@ -51,6 +51,10 @@ picks it up automatically. A copy-paste start is in `templates/ProprietarySWPSla
 Returning a payload from `OnInformation` answers with an I-frame that also carries the acknowledgement;
 returning `null` answers with a bare RR. Either way the sequencing is handled for you.
 
+`Activate()`, `Deactivate()` and `ExchangeFrame()` are `virtual` too, so a model can intercept the
+lifecycle or the raw wire frame — but override them only if you really need to; overriding
+`OnInformation` keeps ACT and SHDLC correct for free.
+
 Capabilities advertised in ACT_INFORMATION are plain properties, settable from a `.repl`:
 `ProtocolVersion`, `SupportedLlcs`, `MaxFramePayloadSize`, `SupportedPowerModes`, `MaxWindowSize`,
 `SelectiveRejectSupport`. The CLF reads `MaxFramePayloadSize` out of ACT_SYNC and refuses to send a
@@ -160,9 +164,16 @@ Pick the mode by how the UICC produces its answer:
 ## Build & test
 
 ```bash
+./tools/swp-selftest/run.sh          # seconds, no Renode checkout - type-check + protocol scenarios
 dotnet build src/Infrastructure/src/Infrastructure.csproj -c Release -p:GUI_DISABLED=true   # compile-check
 ./renode-test tests/peripherals/SWP.robot tests/peripherals/SWP-consistency.robot
 ```
+
+Run the self-test first: it compiles the real sources against Renode API stubs
+(`tools/swp-selftest/`) and drives the CLF and UICC through the codec, activation, SHDLC and the
+error-recovery paths, so a protocol regression shows up long before a Renode build finishes. Add a
+scenario to `SWPSelfTest.cs` when you add a hook. If you change a class the stubs stand in for, the
+stub may need a matching signature — that is the one maintenance cost.
 
 (The Renode build overrides the target framework to `net8.0`; a bare `dotnet build` of the net6.0 csproj
 fails on the GStreamer/GirCore packages.)
