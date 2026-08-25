@@ -1,13 +1,15 @@
-# Agnostic I3C & SPI master/slave for Renode
+# Agnostic I3C, SPI & SWP master/slave for Renode
 
 Generic, reusable **controller (master)** and **target (slave)** models for
-[Renode](https://github.com/renode/renode), for both **I3C** and **SPI**. They are deliberately
-*agnostic*: they do not model any specific SoC's register map. Instead they provide a small,
-well-defined transaction-level interface that proprietary target implementations can plug into, and a
-controller that can drive them from a C# test-bench, the Renode monitor, or robot tests.
+[Renode](https://github.com/renode/renode), for **I3C**, **SPI** and **SWP** (Single Wire Protocol,
+ETSI TS 102 613). They are deliberately *agnostic*: they do not model any specific SoC's register map.
+Instead they provide a small, well-defined interface that proprietary target implementations can plug
+into, and a controller that can drive them from a C# test-bench, the Renode monitor, or robot tests.
 
 Most of this README describes the I3C models; the **SPI** counterpart mirrors them one-to-one — see the
-[SPI counterpart](#spi-counterpart) section and the `wire-spi-slave` skill.
+[SPI counterpart](#spi-counterpart) section and the `wire-spi-slave` skill. The **SWP** models are a
+closer-to-the-wire case: SWP's whole substance is its framing and link layer, so those are implemented
+for real — see [SWP counterpart](#swp-counterpart) and the `wire-swp-slave` skill.
 
 ## Why transaction-level (method calls) rather than raw SDA/SCL?
 
@@ -53,6 +55,13 @@ Everything below is covered by automated tests (`./setup.sh` builds Renode + fir
   driven over TCP through the master to the firmware and back, including a 200-round-trip reliability run.
 - **Java-driven** (`I3C-java.robot` + `java/run-integration.sh`): the Java bridge drives the firmware
   slave through the whole chain; measured **100% reliability** over 1000+ round-trips (avg latency ~1.3 ms).
+
+The SPI suites (`SPI*.robot`) mirror these one-to-one. The SWP suites cover the protocol layers directly:
+`SWP.robot` checks the frame codec against golden vectors (flags, bit stuffing, the CRC check value and a
+bad-CRC rejection), the ACT activation sequence, SHDLC link establishment and window negotiation,
+sequenced transfer across the modulo-8 wrap, line isolation, unsolicited UICC frames and deactivation;
+`SWP-consistency.robot` checks byte-for-byte integrity for large payloads and for payloads that imitate
+the SOF/EOF flags, over both the direct API and the TCP bridge.
 
 ## The `II3CPeripheral` contract
 
@@ -277,3 +286,171 @@ the bridge forwards that raw payload to the client (forward-on-interrupt mode). 
 SPI analog of an I3C IBI, and it replaces host-thread polling — which could never share the CPU's
 simulation time. The `InventedSPITarget` frames the command by chip-select and gates the response behind
 a commit (which fires the interrupt), so a half-written response is never shifted out.
+
+## SWP counterpart
+
+**SWP** (Single Wire Protocol, [ETSI TS 102 613](https://www.etsi.org/deliver/etsi_ts/102600_102699/102613/))
+is the one-wire link between a **CLF** (Contactless Front-end — the master) and a **UICC** (the slave)
+in an NFC-enabled handset. It is not a register bus like I3C or SPI, so the models here sit lower down:
+the S1/S2 bit modulation is abstracted away, but **everything above it is implemented for real** — frame
+delimiting, bit stuffing, the CRC, the ACT activation sequence and the SHDLC link layer. That is where
+SWP's behaviour actually lives, so a model that skipped it would not be modelling SWP at all.
+
+| File | Role |
+|------|------|
+| `ISWPPeripheral.cs` | The UICC (slave) contract: `Activate` / `Deactivate` / `ExchangeFrame` / `FrameAvailable`, plus the interface-state enum. |
+| `SWPFrame.cs` | Data link layer codec (clause 8): SOF `7E`, bit stuffing, CRC-16, EOF `7F`. |
+| `SWPProtocol.cs` | The ACT and SHDLC control-field encodings and frame builders (clauses 10 and 11). |
+| `SimpleSWPPeripheral.cs` | Agnostic UICC base — ACT and SHDLC done for you, with `virtual` hooks to **subclass for proprietary logic**. |
+| `SimpleSWPController.cs` | Agnostic CLF (master); a `SimpleContainer<ISWPPeripheral>` keyed by SWP line, running activation, link establishment and sequenced data transfer. |
+| `SWPTCPBridge.cs` | Raw TCP bridge: the client speaks application payloads, the framing and SHDLC happen inside the emulation. |
+| `Mocks/DummySWPTarget.cs` | Ready-to-use mock UICC (records payloads, transmits unprompted). |
+| `Mocks/EchoSWPDevice.cs` | Mock UICC that echoes each payload back (for consistency testing). |
+| `tests/peripherals/SWP*.robot` | Robot suites: per-feature and data consistency. |
+
+### The three layers
+
+```
+    ┌────────────────────────────────────────────────────────────────────┐
+    │ SHDLC LLC  (clause 10)   I / S / U frames, modulo-8 N(S) & N(R),   │
+    │                          RSET/UA, RR, REJ                          │
+    ├────────────────────────────────────────────────────────────────────┤
+    │ ACT LLC    (clause 11)   ACT_SYNC -> ACT_POWER_MODE -> ACT_READY   │
+    ├────────────────────────────────────────────────────────────────────┤
+    │ Data link  (clause 8)    SOF '7E' | stuffed(payload | CRC) | EOF '7F'│
+    ├────────────────────────────────────────────────────────────────────┤
+    │ Physical                 S1 (CLF -> UICC, voltage), S2 (UICC -> CLF,│
+    │                          current), full duplex        [abstracted]  │
+    └────────────────────────────────────────────────────────────────────┘
+```
+
+**Data link layer.** A frame is `SOF | bit-stuffed(payload | CRC) | EOF`, MSB first. SOF is `7E`
+(six consecutive ones) and EOF is `7F` (seven). A `0` is stuffed after every run of five ones so those
+flags can never occur inside a frame — except that no stuff bit is added when the run of five ends the
+CRC, because the EOF's own leading `0` already breaks it. The CRC is 16 bits, polynomial
+X<sup>16</sup> + X<sup>12</sup> + X<sup>5</sup> + 1, initial value `FFFF`, over the bits between the
+flags. Stuffing makes a frame a whole number of *bits*, so `SWPFrame.Encode` returns the wire image
+bit-packed and pads the tail with idle `0` bits, and the decoder scans it bitwise.
+
+**ACT LLC — activation.** The CLF powers S1; the UICC announces itself with `ACT_SYNC` carrying
+`ACT_INFORMATION` (version, supported LLCs, maximum frame payload, power modes); the CLF answers
+`ACT_POWER_MODE` selecting low or full power; the UICC completes with `ACT_READY`. If a frame is lost
+or corrupted the CLF re-sends `ACT_POWER_MODE` with the **FR** bit set, asking the UICC to repeat its
+last ACT frame — and the UICC honours that until it sees a non-ACT frame, which is the only proof it
+has that its `ACT_READY` got through.
+
+**SHDLC LLC — data.** `RSET`/`UA` establish the link and negotiate the window size and SREJ support.
+Data rides modulo-8 sequenced I-frames; the answer is either piggybacked on an I-frame or a bare `RR`.
+An out-of-sequence I-frame draws a `REJ`, and the sender resynchronises to the `REJ`'s N(R) and
+retransmits. All of this is exercised by the test suites.
+
+### Wiring in a platform (`.repl`)
+
+SWP is point to point, but a CLF usually has more than one SWP line (one to the UICC, one to an
+embedded SE), so targets register by **SWP line number**:
+
+```repl
+swp: SWP.SimpleSWPController @ sysbus 0x40012000
+
+uicc: Mocks.DummySWPTarget @ swp 0
+
+ese: Mocks.DummySWPTarget @ swp 1
+```
+
+### Driving it from the monitor
+
+```
+(machine) swp Activate 0                       # ACT_SYNC / ACT_POWER_MODE / ACT_READY + RSET/UA
+(machine) swp InterfaceState                   # -> Activated
+(machine) swp LinkEstablished                  # -> True
+(machine) swp GetWindowSize 0                  # window agreed in the RSET handshake
+(machine) swp.uicc EnqueueResponsePayloadHex "0102A0"
+(machine) swp SendHex 0 "DEADBEEF"             # one I-frame -> [0x1, 0x2, 0xA0]
+(machine) swp.uicc RequestServiceWithData "AB" # the UICC transmits unprompted
+(machine) swp IRQ IsSet                        # -> True
+(machine) swp LastReceivedPayloadHex           # -> [0xAB]
+(machine) swp Deactivate 0                     # drive S1 low, drop all state
+```
+
+The framing is inspectable on its own, which is the quickest way to check a capture against the model:
+
+```
+(machine) swp EncodeFrameHex "C001"                    # -> [0x7E, 0xC0, 0x1, 0x1B, 0x7A, 0x7F]
+(machine) swp DecodeFrameHex "7EC0011B7A7F"            # -> [0xC0, 0x1]
+(machine) swp ComputeFrameCrc "313233343536373839"     # -> 0x29B1, the CRC check value for "123456789"
+```
+
+### TCP bridge
+
+```
+(machine) swp Activate 0
+(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456        # synchronous
+(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456 true   # forward-on-unsolicited-frame
+(machine) start
+```
+
+The client speaks raw **application payloads** — the framing, the CRC and the SHDLC control byte are
+added and stripped inside the emulation, exactly as on a real link. As with the I3C and SPI bridges,
+every exchange is marshalled onto the machine's time domain
+(`machine.HandleTimeDomainEvent(..., timeDomainInternalEvent: false)`), so the CLF drives the UICC on
+the same simulation clock as the CPU and a run is reproducible regardless of host timing — which is why
+the emulation must be running.
+
+### Wiring a proprietary UICC
+
+Subclass `SimpleSWPPeripheral` and override the hooks; ACT and SHDLC are already handled.
+
+```csharp
+namespace Antmicro.Renode.Peripherals.SWP
+{
+    public class MyProprietaryUicc : SimpleSWPPeripheral
+    {
+        public MyProprietaryUicc()
+        {
+            MaxFramePayloadSize = 254;   // advertised to the CLF in ACT_INFORMATION
+        }
+
+        // A well-sequenced I-frame arrived. Return a payload to answer with an I-frame (the
+        // acknowledgement rides along), or null for a bare RR.
+        protected override byte[] OnInformation(byte[] payload)
+        {
+            return HandleApdu(payload);
+        }
+
+        protected override void OnLinkEstablished()
+        {
+            // the SHDLC link is up
+        }
+
+        private void SensorReady()
+        {
+            // transmit without being polled - SWP is full duplex
+            SendInformation(new byte[] { 0xF0, 0x5A });
+        }
+    }
+}
+```
+
+### Standards fidelity
+
+Taken from the specification and implemented as written: the frame structure and flag values, MSB-first
+bit order, the bit-stuffing rule including the end-of-CRC exception, the CRC polynomial and initial
+value, the ACT frame set and its sequencing including FR-based frame resend, the ACT_INFORMATION fields,
+and the full SHDLC control-byte encoding (I / S / U heads, N(S), N(R), RR/REJ/RNR/SREJ, RSET/UA with
+window and SREJ negotiation) with modulo-8 sequencing.
+
+Two deliberate choices are worth knowing about:
+
+- **The physical layer is abstracted.** S1/S2 pulse-width modulation, the current-domain signalling and
+  the electrical activation timings are not simulated; `Activate` / `Deactivate` / `ExchangeFrame` stand
+  in for them. Everything above the wire is real.
+- **The numeric ACT opcodes and the ACT_INFORMATION byte layout are this model's profile.** The frame
+  set, the fields and the sequencing follow the specification, but the specific control-byte values are
+  gathered in `SWPProtocol` so that matching a particular implementation is a matter of changing those
+  constants and nothing else. The SHDLC encoding, by contrast, is the ETSI one as found in shipping
+  stacks (e.g. the Linux kernel's `net/nfc/hci/llc_shdlc.c`).
+
+Also out of scope, kept simple on purpose: the CLT (contactless tunnelling) LLC, frame segmentation and
+reassembly above the negotiated maximum frame size (an oversized payload is refused with a warning),
+SHDLC timers T1/T2/T3, and pipelining more than one unacknowledged I-frame at a time — the negotiated
+window is honoured and reported but the models exchange one frame at a time.

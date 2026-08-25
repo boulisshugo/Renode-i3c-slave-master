@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Clones Renode, overlays the agnostic I3C master/slave peripherals from this
-# repository, builds Renode headless, and runs the I3C robot test.
+# Clones Renode, overlays the agnostic I3C, SPI and SWP master/slave peripherals
+# from this repository, builds Renode headless, and runs the robot tests.
 #
 # Environment overrides:
 #   RENODE_DIR     - where to place the Renode checkout (default: ./renode)
@@ -34,7 +34,7 @@ else
     echo "   (skipping - using the pre-built *-firmware.elf committed in the repo)"
 fi
 
-echo ">> Overlaying I3C peripherals, tests and firmware"
+echo ">> Overlaying I3C, SPI and SWP peripherals, tests and firmware"
 # The overlay mirrors Renode's directory layout, so this drops each file in place.
 cp -rv "$HERE/renode-overlay/." "$RENODE_DIR/"
 
@@ -53,7 +53,7 @@ else
     echo "   (skipping Java bridge build - JDK not found)"
 fi
 
-echo ">> Running the I3C and SPI robot suites"
+echo ">> Running the I3C, SPI and SWP robot suites"
 ( cd "$RENODE_DIR" && ./renode-test \
     tests/peripherals/I3C.robot \
     tests/peripherals/I3C-consistency.robot \
@@ -61,6 +61,8 @@ echo ">> Running the I3C and SPI robot suites"
     tests/peripherals/SPI.robot \
     tests/peripherals/SPI-consistency.robot \
     tests/peripherals/SPI-firmware.robot \
+    tests/peripherals/SWP.robot \
+    tests/peripherals/SWP-consistency.robot \
     ${JAVA_SUITES} )
 
 echo ">> All done."
