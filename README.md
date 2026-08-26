@@ -291,6 +291,10 @@ a commit (which fires the interrupt), so a half-written response is never shifte
 
 ## SWP counterpart
 
+> **Integrating your own SWP device?** [`SWP-INTEGRATION.md`](SWP-INTEGRATION.md) is a step-by-step
+> guide with the exact paths: where to put your class, what to override, the `.repl`, the monitor
+> commands, how to read the raw frames, and what to change if your silicon differs from the profile.
+
 **SWP** (Single Wire Protocol, [ETSI TS 102 613](https://www.etsi.org/deliver/etsi_ts/102600_102699/102613/))
 is the one-wire link between a **CLF** (Contactless Front-end — the master) and a **UICC** (the slave)
 in an NFC-enabled handset. It is not a register bus like I3C or SPI, so the models here sit lower down:

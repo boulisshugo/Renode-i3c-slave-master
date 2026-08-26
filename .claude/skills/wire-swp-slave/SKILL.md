@@ -5,6 +5,9 @@ description: Use when wiring a proprietary SWP (Single Wire Protocol, ETSI TS 10
 
 # Wiring a proprietary SWP slave in Renode
 
+For the same material as a standalone document the user can read outside a Claude session, see
+`SWP-INTEGRATION.md` at the repository root.
+
 This repo provides agnostic SWP models
 (`renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/`), built on a new
 `ISWPPeripheral` contract (`Activate` / `Deactivate` / `ExchangeFrame` / `FrameAvailable`):
