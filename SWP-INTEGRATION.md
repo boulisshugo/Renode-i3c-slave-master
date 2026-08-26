@@ -189,6 +189,15 @@ swp:  SWP.SimpleSWPController @ sysbus
 uicc: SWP.MyUicc @ swp 0
 ```
 
+**The controller takes no address, and that is deliberate.** The CLF is a separate chip on the far end
+of the SWP line, not a block inside the SoC. It has no register map, so `SimpleSWPController` is neither
+`IDoubleWordPeripheral` nor `IKnownSize`, and it registers on the sysbus with no address at all — giving
+it one would make the bus lie about what is actually memory-mapped, and would suggest firmware could
+reach it through registers, which it cannot. The monitor still addresses it as `sysbus.swp`.
+
+The only thing in an SWP platform that legitimately takes a sysbus address is a **firmware-managed
+UICC**, which really is memory-mapped — see [Firmware-managed UICC](#firmware-managed-uicc).
+
 **Where to set the capabilities.** The most reliable place is your class's constructor, as in Step 1 —
 it is plain C# and cannot be mis-spelled. Renode's `.repl` can also set public properties directly, but
 names there are case-sensitive and must match the C# spelling exactly
@@ -444,6 +453,10 @@ call back into the peripheral.
 
 **The type prefix in a `.repl` is the namespace tail.** `Antmicro.Renode.Peripherals.SWP.MyUicc` is
 `SWP.MyUicc`; a mock in `…Peripherals.Mocks` is `Mocks.DummySWPTarget`.
+
+**Don't give the controller an address out of habit.** `SWP.SimpleSWPController @ sysbus 0x40012000`
+looks natural and is wrong — the controller has no registers. Only a firmware-managed UICC gets an
+address, through the multi-registration form.
 
 **`.repl` attribute names are case-sensitive** and must match the C# constructor parameter or property
 exactly. Prefer the constructor for anything you always want set — it cannot be mis-spelled, and every

@@ -80,6 +80,12 @@ spi: SPI.SimpleSPIController @ sysbus
 slave: SPI.MyProprietarySPISlave @ spi 0
 ```
 
+**The controller takes no address.** A bus controller here is not a block inside the SoC: it has no
+register map, so it is not `IDoubleWordPeripheral` and not `IKnownSize`, and it registers on the sysbus
+with **no address at all**. Giving it one would make the bus lie about what is actually memory-mapped.
+The monitor still reaches it as `sysbus.spi`. Only a genuinely memory-mapped, firmware-driven
+model — ``InventedSPITarget`` below — gets an address.
+
 **Multi-registration** (a firmware-managed slave on both the sysbus and the SPI bus) uses `@ { ... }` —
 see `templates/platform.repl` and `renode-overlay/tests/peripherals/SPI-firmware.repl`:
 
@@ -107,7 +113,11 @@ spi.slave0 LastReceivedHex                   # DummySPITarget: MOSI bytes of the
 
 **Monitor gotchas (learned the hard way on I3C, they apply here too):**
 
-- **Quote hex/string args**, especially long ones: `TransferHex 0 "DEAD…"`. Unquoted long tokens fail
+- **Don't give the controller a sysbus address out of habit.** `SPI.SimpleSPIController @ sysbus 0x…` looks
+natural and is wrong: the controller has no register map. Only InventedSPITarget, which really is
+memory-mapped, gets an address.
+
+**Quote hex/string args**, especially long ones: `TransferHex 0 "DEAD…"`. Unquoted long tokens fail
   with *"Parameters did not match the signature"*.
 - **`byte[]` params are not monitor-friendly.** Expose `…Hex(int cs, string hex)` helpers; keep `byte[]`
   overloads for C# test-benches.

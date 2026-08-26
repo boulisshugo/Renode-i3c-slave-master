@@ -119,6 +119,12 @@ slave0: I3C.DummyI3CSlave @ i3c 0x08
     deviceCharacteristics: 0xC5
 ```
 
+**The controller takes no sysbus address.** A controller here models a bus master, not a block inside
+the SoC — it has no register map, so it is neither `IDoubleWordPeripheral` nor `IKnownSize` and claims
+no address space. The monitor still reaches it as `sysbus.i3c`. The only models in this repo that do
+take an address are `InventedI3CTarget` and `InventedSPITarget`, which really are memory-mapped and
+driven by CPU firmware. The same holds for the SPI and SWP controllers.
+
 ## Driving it from the monitor
 
 ```
@@ -364,6 +370,9 @@ uicc: Mocks.DummySWPTarget @ swp 0
 
 ese: Mocks.DummySWPTarget @ swp 1
 ```
+
+As with the I3C and SPI controllers, the CLF takes **no sysbus address** — it is a separate chip with no
+register map, so claiming address space would misrepresent what is memory-mapped.
 
 ### Driving it from the monitor
 
