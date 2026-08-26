@@ -1,0 +1,30 @@
+// Minimal SWP platform: a CLF master with one proprietary UICC on SWP line 0.
+//
+//   (machine) swp Activate 0
+//   (machine) swp SendHex 0 "0102"
+
+swp: SWP.SimpleSWPController @ sysbus 0x40012000
+
+uicc: SWP.MyProprietarySWPSlave @ swp 0
+
+// ---------------------------------------------------------------------------------------------
+// Firmware-managed variant: the UICC is registered on BOTH the sysbus (memory-mapped registers the
+// CPU firmware drives) and the SWP line (so the CLF can reach it). Needs the class to implement
+// IDoubleWordPeripheral and IKnownSize as well.
+// ---------------------------------------------------------------------------------------------
+//
+// mem: Memory.MappedMemory @ sysbus 0x80000000
+//     size: 0x100000
+//
+// cpu: CPU.RiscV32 @ sysbus
+//     cpuType: "rv32imac"
+//     timeProvider: clint
+//
+// clint: IRQControllers.CoreLevelInterruptor @ sysbus 0x02000000
+//     frequency: 1000000
+//     [0, 1] -> cpu@[3, 7]
+//
+// uicc: SWP.MyFirmwareManagedUicc @ {
+//         sysbus 0x90000000;
+//         swp 0
+//     }
