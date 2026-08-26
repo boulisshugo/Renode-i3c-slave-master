@@ -204,5 +204,54 @@ namespace Antmicro.Renode.Peripherals.SWP
         {
             return new byte[] { windowSize, (byte)(selectiveRejectSupport ? 1 : 0) };
         }
+
+        // ------------------------------------------------------------------------------------------
+        // Decoding a frame for a human
+        // ------------------------------------------------------------------------------------------
+
+        // Names an LLC payload from its control field: "ACT_SYNC", "I N(S)=0 N(R)=1 +2B", "RR N(R)=2".
+        // Used by the frame trace, and useful from a test or a proprietary model reading a capture.
+        //
+        // Which LLC a control byte belongs to follows from its value: the ACT opcodes sit at the bottom
+        // of the range and SHDLC occupies '80'..'FF', so the two can be told apart without knowing the
+        // interface state.
+        public static string Describe(byte[] payload)
+        {
+            if(payload == null || payload.Length == 0)
+            {
+                return "(empty)";
+            }
+
+            var control = payload[0];
+            var extra = payload.Length > 1 ? $" +{payload.Length - 1}B" : string.Empty;
+
+            switch(control)
+            {
+            case ActSync:
+                return "ACT_SYNC" + extra;
+            case ActReady:
+                return "ACT_READY" + extra;
+            case ActPowerMode:
+                var parameter = payload.Length > 1 ? payload[1] : (byte)0;
+                var mode = (parameter & ActPowerModeFullPowerBit) != 0 ? "full power" : "low power";
+                var resend = (parameter & ActPowerModeFrameResendBit) != 0 ? " FR=1" : string.Empty;
+                return $"ACT_POWER_MODE {mode}{resend}";
+            }
+
+            if(control < ControlHeadInformation)
+            {
+                return $"unknown control 0x{control:X2}{extra}";
+            }
+
+            switch(GetFrameKind(control))
+            {
+            case ShdlcFrameKind.Information:
+                return $"I   N(S)={GetSendSequence(control)} N(R)={GetReceiveSequence(control)}{extra}";
+            case ShdlcFrameKind.Supervisory:
+                return $"{GetSupervisoryType(control)} N(R)={GetReceiveSequence(control)}{extra}";
+            default:
+                return $"{GetModifier(control)}{extra}";
+            }
+        }
     }
 }

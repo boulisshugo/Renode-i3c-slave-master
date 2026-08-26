@@ -25,6 +25,7 @@ public static class SWPSelfTest
         Activation();
         Shdlc();
         Recovery();
+        FrameTrace();
         Console.WriteLine();
         Console.WriteLine(failures == 0 ? "ALL C# SCENARIOS PASS" : failures + " FAILURE(S)");
         return failures == 0 ? 0 : 1;
@@ -227,6 +228,91 @@ public static class SWPSelfTest
         Check("  by re-sending ACT_POWER_MODE with FR = 1", Logged("FR = 1"));
         var probe = RandomBytes(16);
         Check("  and data flows afterwards", clfFlaky.Send(0, probe).SequenceEqual(probe));
+    }
+
+    // ----------------------------------------------------------------------------------------
+    private static void FrameTrace()
+    {
+        Section("Raw frame trace on the slave");
+
+        var uicc = new TracingUicc();
+        var clf = Build(uicc);
+        clf.Activate(0);
+        clf.Send(0, Hex("DEAD"));
+        uicc.Notify(Hex("5A"));
+
+        // Every layer must appear, and the ACT_SYNC and the unsolicited I-frame are the two that do
+        // not pass through ExchangeFrame - a trace that hooks only that method silently loses them.
+        Check("the trace captures the UICC's opening ACT_SYNC", uicc.Sent.Any(x => x.StartsWith("ACT_SYNC")));
+        Check("  the CLF's ACT_POWER_MODE, decoded",
+            uicc.Received.Any(x => x == "ACT_POWER_MODE full power"));
+        Check("  the UICC's ACT_READY", uicc.Sent.Contains("ACT_READY"));
+        Check("  the SHDLC RSET and UA",
+            uicc.Received.Any(x => x.StartsWith("Reset")) && uicc.Sent.Any(x => x.StartsWith("Unnumbered")));
+        Check("  the I-frame in, with its sequence numbers",
+            uicc.Received.Any(x => x.StartsWith("I   N(S)=0 N(R)=0")));
+        Check("  the I-frame out", uicc.Sent.Any(x => x.StartsWith("I   N(S)=0 N(R)=1")));
+        Check("  the unsolicited I-frame, which never passes through ExchangeFrame",
+            uicc.Sent.Any(x => x.StartsWith("I   N(S)=1 N(R)=1")));
+
+        Check("the hooks and the FrameTraced event agree",
+            uicc.Events == uicc.Sent.Count + uicc.Received.Count);
+
+        // The raw wire image is what a capture would show.
+        Check("the last frame out is the unsolicited I-frame, raw",
+            uicc.LastFrameOutHex == "[0x7E, 0x89, 0x5A, 0x47, 0xB0, 0x7F]", uicc.LastFrameOutHex);
+        Check("  and its decoded payload keeps the control field",
+            uicc.LastPayloadOutHex == "[0x89, 0x5A]", uicc.LastPayloadOutHex);
+
+        // Eight frames: ACT_SYNC, ACT_POWER_MODE, ACT_READY, RSET, UA, then the I-frame each way,
+        // then the unsolicited one.
+        var lines = uicc.FrameTraceHex.Split('\n').Length;
+        Check("the rolling trace holds every frame of the session", lines == 8, lines + " lines");
+
+        // A malformed frame is the case a trace exists for, so it must not be dropped silently.
+        var bad = SWPFrame.Encode(new byte[] { 0x80, 0x01 });
+        bad[2] ^= 0x40;
+        uicc.ClearFrameTrace();
+        uicc.ExchangeFrame(bad);
+        Check("a malformed frame is still traced", uicc.Received.Any(x => x.StartsWith("malformed")));
+        Check("  and is flagged as such rather than decoded", uicc.LastPayloadInHex == "[]");
+
+        // Depth 0 turns recording off without disturbing the Last* properties.
+        var quiet = new TracingUicc { FrameTraceDepth = 0 };
+        var clfQuiet = Build(quiet);
+        clfQuiet.Activate(0);
+        Check("FrameTraceDepth 0 disables the rolling trace",
+            quiet.FrameTraceHex == "(no frames traced)");
+        Check("  but the last frame is still observable", quiet.LastFrameOut == "UnnumberedAcknowledgement +2B",
+            quiet.LastFrameOut);
+
+        var capped = new TracingUicc { FrameTraceDepth = 3 };
+        var clfCapped = Build(capped);
+        clfCapped.Activate(0);
+        clfCapped.Send(0, Hex("01"));
+        Check("the trace is bounded by FrameTraceDepth",
+            capped.FrameTraceHex.Split('\n').Length == 3);
+    }
+
+    // A UICC that records what the frame hooks hand it - the shape a real tracing model would take.
+    private class TracingUicc : SimpleSWPPeripheral
+    {
+        public readonly List<string> Received = new List<string>();
+        public readonly List<string> Sent = new List<string>();
+        public int Events;
+
+        public TracingUicc()
+        {
+            FrameTraced += (_, __) => Events++;
+        }
+
+        public void Notify(byte[] payload) { SendInformation(payload); }
+
+        protected override byte[] OnInformation(byte[] payload) { return payload; }
+
+        protected override void OnFrameReceived(SWPFrameRecord frame) { Received.Add(frame.Description); }
+
+        protected override void OnFrameSent(SWPFrameRecord frame) { Sent.Add(frame.Description); }
     }
 
     // ----------------------------------------------------------------------------------------

@@ -303,7 +303,8 @@ SWP's behaviour actually lives, so a model that skipped it would not be modellin
 | `ISWPPeripheral.cs` | The UICC (slave) contract: `Activate` / `Deactivate` / `ExchangeFrame` / `FrameAvailable`, plus the interface-state enum. |
 | `SWPFrame.cs` | Data link layer codec (clause 8): SOF `7E`, bit stuffing, CRC-16, EOF `7F`. |
 | `SWPProtocol.cs` | The ACT and SHDLC control-field encodings and frame builders (clauses 10 and 11). |
-| `SimpleSWPPeripheral.cs` | Agnostic UICC base — ACT and SHDLC done for you, with `virtual` hooks to **subclass for proprietary logic**. |
+| `SimpleSWPPeripheral.cs` | Agnostic UICC base — ACT and SHDLC done for you, with `virtual` hooks to **subclass for proprietary logic**, and a raw-frame trace. |
+| `SWPFrameRecord.cs` | One traced frame: raw wire image, decoded payload, and a human-readable name. |
 | `SimpleSWPController.cs` | Agnostic CLF (master); a `SimpleContainer<ISWPPeripheral>` keyed by SWP line, running activation, link establishment and sequenced data transfer. |
 | `SWPTCPBridge.cs` | Raw TCP bridge: the client speaks application payloads, the framing and SHDLC happen inside the emulation. |
 | `Mocks/DummySWPTarget.cs` | Ready-to-use mock UICC (records payloads, transmits unprompted). |
@@ -433,6 +434,32 @@ namespace Antmicro.Renode.Peripherals.SWP
     }
 }
 ```
+
+### Reading the raw frames
+
+Every frame crossing the wire is traced on the target, whichever layer it belongs to — so the ACT
+activation and the SHDLC conversation land in one log, readable straight from the monitor:
+
+```
+(machine) swp Activate 0
+(machine) swp.uicc FrameTraceHex
+out  7E0101051000032EA47F      ACT_SYNC +5B
+in   7E02016B4C7F              ACT_POWER_MODE full power
+out  7E03D1937F                ACT_READY
+in   7EF882003E66DFC0          Reset +2B
+out  7EE6040012C97F            UnnumberedAcknowledgement +2B
+```
+
+`LastFrameInHex` / `LastFrameOutHex` give the raw on-wire image, `LastPayloadInHex` /
+`LastPayloadOutHex` the decoded LLC payload with its control field, and `ExchangeFrameHex` injects a
+raw frame at the target — enough to replay a capture or feed a deliberately corrupt frame without
+writing C#. `FrameTraceDepth` bounds the rolling trace (0 disables it; default 32).
+
+From code, override `OnFrameReceived` / `OnFrameSent`, or subscribe to `FrameTraced`. Recording sits at
+the two choke points every frame must pass, which matters because the opening `ACT_SYNC` and
+unsolicited I-frames never pass through `ExchangeFrame` — a model hooking only that method would lose
+them. Malformed frames are traced too, flagged rather than decoded: a trace that hides bad frames is no
+use for the job you opened it for.
 
 ### Self-test without a Renode checkout
 

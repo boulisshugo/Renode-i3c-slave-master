@@ -30,6 +30,13 @@ namespace Antmicro.Renode.Peripherals.SWP
     // for proprietary behaviour, and call SendInformation to transmit on the UICC's own initiative -
     // SWP is full duplex, so the UICC does not have to wait to be polled.
     //
+    // Every frame crossing the wire is traced, whichever layer it belongs to: ACT frames, SHDLC
+    // frames, and frames that failed to decode. Reach the raw bytes through the OnFrameReceived /
+    // OnFrameSent hooks, the FrameTraced event, or - from the monitor and robot tests - the
+    // LastFrameInHex / LastFrameOutHex / FrameTraceHex properties. Recording happens at the two
+    // choke points every frame must pass (Transmit on the way out, the decode in ExchangeFrame on
+    // the way in), so no layer and no code path can slip past it.
+    //
     // NOTE (same gotcha as the I3C/SPI models): the constructor calls the virtual Reset(), so every
     // field Reset() touches must be a field initializer, not a constructor-body assignment.
     public class SimpleSWPPeripheral : ISWPPeripheral
@@ -44,6 +51,7 @@ namespace Antmicro.Renode.Peripherals.SWP
             lock(locker)
             {
                 responseQueue.Clear();
+                ClearFrameTrace();
                 ResetLinkState();
                 InterfaceState = SWPInterfaceState.Deactivated;
                 PowerMode = SWPPowerMode.LowPower;
@@ -103,10 +111,13 @@ namespace Antmicro.Renode.Peripherals.SWP
                     FrameErrors++;
                     // A corrupted frame is simply not acknowledged: the CLF recovers by re-sending
                     // ACT_POWER_MODE with FR = 1 during activation, or by its SHDLC timeout after.
+                    // It is still traced - a trace that hides bad frames is no use for debugging.
+                    Record(SWPFrameDirection.Received, wireFrame, null, "malformed: " + error);
                     this.Log(LogLevel.Warning, "Discarding a malformed frame: {0}", error);
                     return Nothing;
                 }
                 FramesReceived++;
+                Record(SWPFrameDirection.Received, wireFrame, payload, SWPProtocol.Describe(payload));
                 if(payload.Length == 0)
                 {
                     this.Log(LogLevel.Warning, "Discarding an empty frame (no control field)");
@@ -178,6 +189,81 @@ namespace Antmicro.Renode.Peripherals.SWP
         // Number of REJ frames this target has sent (an out-of-sequence I-frame arrived).
         public int RejectsSent { get; private set; }
 
+        // --------------------------------------------------------------------------------------
+        // Frame trace - the raw wire image of every frame, whichever layer it belongs to
+        // --------------------------------------------------------------------------------------
+
+        // Raw on-wire image of the last frame in / out, hex-encoded (monitor-readable).
+        public string LastFrameInHex => Misc.PrettyPrintCollectionHex(lastFrameIn?.WireFrame ?? EmptyBytes);
+        public string LastFrameOutHex => Misc.PrettyPrintCollectionHex(lastFrameOut?.WireFrame ?? EmptyBytes);
+
+        // Decoded LLC payload of the last frame in / out - control field first - hex-encoded.
+        public string LastPayloadInHex => Misc.PrettyPrintCollectionHex(lastFrameIn?.Payload ?? EmptyBytes);
+        public string LastPayloadOutHex => Misc.PrettyPrintCollectionHex(lastFrameOut?.Payload ?? EmptyBytes);
+
+        // Human-readable name of the last frame in / out, e.g. "ACT_READY" or "I   N(S)=0 N(R)=1 +2B".
+        public string LastFrameIn => lastFrameIn?.Description ?? string.Empty;
+        public string LastFrameOut => lastFrameOut?.Description ?? string.Empty;
+
+        // How many frames the rolling trace keeps. 0 disables recording; the Last* properties above
+        // are always maintained regardless. Settable from a .repl or the monitor.
+        public int FrameTraceDepth
+        {
+            get => frameTraceDepth;
+            set
+            {
+                lock(locker)
+                {
+                    frameTraceDepth = Math.Max(0, value);
+                    TrimTrace();
+                }
+            }
+        }
+
+        // The rolling trace, one frame per line: direction, raw wire bytes, decoded name.
+        public string FrameTraceHex
+        {
+            get
+            {
+                lock(locker)
+                {
+                    return frameTrace.Count == 0
+                        ? "(no frames traced)"
+                        : string.Join(Environment.NewLine, frameTrace.Select(x => x.ToString()));
+                }
+            }
+        }
+
+        // The traced frames, newest last. Snapshot - safe to enumerate.
+        public IEnumerable<SWPFrameRecord> FrameTrace
+        {
+            get
+            {
+                lock(locker)
+                {
+                    return frameTrace.ToArray();
+                }
+            }
+        }
+
+        public void ClearFrameTrace()
+        {
+            lock(locker)
+            {
+                frameTrace.Clear();
+                lastFrameIn = null;
+                lastFrameOut = null;
+            }
+        }
+
+        // Raised for every frame crossing the wire in either direction, at every layer - ACT frames,
+        // SHDLC frames and malformed ones alike. Subscribe instead of subclassing when a bridge or a
+        // test wants the raw bytes.
+        //
+        // Fired while the peripheral's lock is held (as OnInformation is): a handler must not call
+        // back into this peripheral.
+        public event Action<ISWPPeripheral, SWPFrameRecord> FrameTraced;
+
         // Queues one payload to be returned in an I-frame in answer to the next I-frame received.
         public void EnqueueResponsePayload(IEnumerable<byte> payload)
         {
@@ -191,6 +277,15 @@ namespace Antmicro.Renode.Peripherals.SWP
         public void EnqueueResponsePayloadHex(string hexPayload)
         {
             EnqueueResponsePayload(Misc.HexStringToByteArray(hexPayload));
+        }
+
+        // Monitor-friendly helper: push a raw wire frame straight at the target, as if the CLF had
+        // sent it, and get its answer back hex-encoded. Useful for replaying a capture or feeding a
+        // deliberately corrupt frame without writing a C# test-bench (ExchangeFrame itself takes a
+        // byte[], which the monitor cannot bind).
+        public string ExchangeFrameHex(string hexWireFrame)
+        {
+            return Misc.PrettyPrintCollectionHex(ExchangeFrame(Misc.HexStringToByteArray(hexWireFrame)));
         }
 
         // --------------------------------------------------------------------------------------
@@ -214,6 +309,23 @@ namespace Antmicro.Renode.Peripherals.SWP
 
         // Called when the CLF deactivates the interface. Default: no-op.
         protected virtual void OnDeactivated()
+        {
+        }
+
+        // Called for every frame received from the CLF, before it is acted on - ACT frames, SHDLC
+        // frames, and frames that failed to decode (frame.IsMalformed). Default: no-op.
+        //
+        // Runs with the peripheral's lock held; do not call back into this peripheral from it.
+        protected virtual void OnFrameReceived(SWPFrameRecord frame)
+        {
+        }
+
+        // Called for every frame this peripheral transmits, at every layer: the ACT_SYNC that opens
+        // activation, every ACT and SHDLC answer, and unsolicited I-frames from SendInformation.
+        // Default: no-op.
+        //
+        // Runs with the peripheral's lock held; do not call back into this peripheral from it.
+        protected virtual void OnFrameSent(SWPFrameRecord frame)
         {
         }
 
@@ -402,10 +514,55 @@ namespace Antmicro.Renode.Peripherals.SWP
             }
         }
 
+        // Every frame this peripheral sends goes through here - the ACT_SYNC from Activate, every
+        // ACT and SHDLC answer, and the unsolicited I-frames from SendInformation - so recording at
+        // this one point cannot miss a layer.
         private byte[] Transmit(byte[] payload)
         {
             FramesSent++;
-            return SWPFrame.Encode(payload);
+            var wire = SWPFrame.Encode(payload);
+            Record(SWPFrameDirection.Sent, wire, payload, SWPProtocol.Describe(payload));
+            return wire;
+        }
+
+        // Called with the lock held, from the two choke points (Transmit and the decode in
+        // ExchangeFrame), so no frame reaches the wire without passing through it.
+        private void Record(SWPFrameDirection direction, byte[] wireFrame, byte[] payload, string description)
+        {
+            var record = new SWPFrameRecord(direction, wireFrame, payload, description);
+            if(direction == SWPFrameDirection.Received)
+            {
+                lastFrameIn = record;
+            }
+            else
+            {
+                lastFrameOut = record;
+            }
+
+            if(frameTraceDepth > 0)
+            {
+                frameTrace.Enqueue(record);
+                TrimTrace();
+            }
+
+            this.Log(LogLevel.Noisy, "{0}", record);
+            if(direction == SWPFrameDirection.Received)
+            {
+                OnFrameReceived(record);
+            }
+            else
+            {
+                OnFrameSent(record);
+            }
+            FrameTraced?.Invoke(this, record);
+        }
+
+        private void TrimTrace()
+        {
+            while(frameTrace.Count > frameTraceDepth)
+            {
+                frameTrace.Dequeue();
+            }
         }
 
         private void ResetLinkState()
@@ -427,9 +584,18 @@ namespace Antmicro.Renode.Peripherals.SWP
         private byte[] lastActPayload;
         private byte[] lastReceivedPayload = new byte[0];
 
+        private SWPFrameRecord lastFrameIn;
+        private SWPFrameRecord lastFrameOut;
+        private int frameTraceDepth = DefaultFrameTraceDepth;
+
+        private readonly Queue<SWPFrameRecord> frameTrace = new Queue<SWPFrameRecord>();
         private readonly Queue<byte[]> responseQueue = new Queue<byte[]>();
         private readonly object locker = new object();
 
+        // Frames kept by default. Cheap - the trace stores references to arrays that already exist.
+        private const int DefaultFrameTraceDepth = 32;
+
         private static readonly byte[] Nothing = new byte[0];
+        private static readonly byte[] EmptyBytes = new byte[0];
     }
 }

@@ -266,6 +266,61 @@ Should Re-Activate After A Deactivation
     Should Contain              ${answer}  [0x99]
 
 # --------------------------------------------------------------------------------------------------
+# Raw frame trace on the slave - every layer, readable without writing C#
+# --------------------------------------------------------------------------------------------------
+Should Trace The Raw Activation Frames
+    Create Activated Machine
+
+    # ACT_SYNC never passes through ExchangeFrame and the RSET/UA pair belongs to a different LLC,
+    # yet all of them are in the one trace.
+    ${trace}=                   Execute Command  swp.uicc FrameTraceHex
+    Should Contain              ${trace}  ACT_SYNC
+    Should Contain              ${trace}  ACT_POWER_MODE full power
+    Should Contain              ${trace}  ACT_READY
+    Should Contain              ${trace}  Reset
+    Should Contain              ${trace}  UnnumberedAcknowledgement
+
+Should Trace The Raw SHDLC Frames
+    Create Activated Machine
+
+    Execute Command             swp.uicc ClearFrameTrace
+    Execute Command             swp.uicc EnqueueResponsePayloadHex "77"
+    Execute Command             swp SendHex 0 "DEAD"
+
+    ${trace}=                   Execute Command  swp.uicc FrameTraceHex
+    Should Contain              ${trace}  I   N(S)=0 N(R)=0
+    Should Contain              ${trace}  I   N(S)=0 N(R)=1
+
+    # The raw wire image, and the payload with its SHDLC control field still on the front.
+    ${wire}=                    Execute Command  swp.uicc LastFrameOutHex
+    Should Contain              ${wire}  [0x7E, 0x81, 0x77
+    ${payload}=                 Execute Command  swp.uicc LastPayloadInHex
+    Should Contain              ${payload}  [0x80, 0xDE, 0xAD]
+
+Should Trace A Malformed Frame Rather Than Drop It Silently
+    Create Activated Machine
+
+    Execute Command             swp.uicc ClearFrameTrace
+    # A valid RR is 7E C0 01 1B 7A 7F; this one carries a corrupted CRC, so it must not be accepted.
+    Execute Command             swp.uicc ExchangeFrameHex "7EC001C67A7F"
+
+    ${trace}=                   Execute Command  swp.uicc FrameTraceHex
+    Should Contain              ${trace}  malformed
+    ${payload}=                 Execute Command  swp.uicc LastPayloadInHex
+    Should Contain              ${payload}  []
+
+Should Let The Trace Be Turned Off
+    Create Machine
+    Execute Command             swp.uicc FrameTraceDepth 0
+    Execute Command             swp Activate 0
+
+    ${trace}=                   Execute Command  swp.uicc FrameTraceHex
+    Should Contain              ${trace}  no frames traced
+    # The last frame stays observable even with recording off.
+    ${last}=                    Execute Command  swp.uicc LastFrameOut
+    Should Contain              ${last}  UnnumberedAcknowledgement
+
+# --------------------------------------------------------------------------------------------------
 # TCP bridge round-trip
 # --------------------------------------------------------------------------------------------------
 Should Bridge Raw Payloads Over TCP

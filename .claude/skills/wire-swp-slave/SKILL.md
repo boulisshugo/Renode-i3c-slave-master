@@ -47,6 +47,8 @@ picks it up automatically. A copy-paste start is in `templates/ProprietarySWPSla
 | `OnLinkEstablished()` | the RSET/UA handshake completed | no-op |
 | `OnDeactivated()` | the CLF drove S1 low | no-op |
 | `SendInformation(byte[] payload)` | *you call it* to transmit unprompted | — |
+| `OnFrameReceived(SWPFrameRecord)` | every frame in — ACT, SHDLC, and malformed ones | no-op |
+| `OnFrameSent(SWPFrameRecord)` | every frame out, at every layer | no-op |
 
 Returning a payload from `OnInformation` answers with an I-frame that also carries the acknowledgement;
 returning `null` answers with a bare RR. Either way the sequencing is handled for you.
@@ -54,6 +56,26 @@ returning `null` answers with a bare RR. Either way the sequencing is handled fo
 `Activate()`, `Deactivate()` and `ExchangeFrame()` are `virtual` too, so a model can intercept the
 lifecycle or the raw wire frame — but override them only if you really need to; overriding
 `OnInformation` keeps ACT and SHDLC correct for free.
+
+### Getting at the raw frames
+
+`OnFrameReceived` / `OnFrameSent` hand you a `SWPFrameRecord` for **every** frame crossing the wire,
+whichever layer it belongs to:
+
+| Field | What it holds |
+|-------|---------------|
+| `WireFrame` | the raw on-wire image — SOF, bit-stuffed body, CRC, EOF, bit-packed |
+| `Payload` | the decoded LLC payload, control field first; empty when the frame was malformed |
+| `Description` | `"ACT_SYNC"`, `"I   N(S)=0 N(R)=1 +2B"`, `"RR N(R)=2"`, `"malformed: CRC mismatch…"` |
+| `Direction`, `IsMalformed`, `WireHex`, `PayloadHex` | convenience |
+
+Recording happens at the two choke points every frame must pass — `Transmit` on the way out, the
+decode in `ExchangeFrame` on the way in — so no layer and no code path can slip past. **This matters:**
+the opening `ACT_SYNC` and unsolicited I-frames from `SendInformation` never pass through
+`ExchangeFrame`, so a model that hooks only that method silently loses them.
+
+Prefer `FrameTraced` (an event) over subclassing when a bridge or a test just wants the bytes. Both the
+hooks and the event fire with the peripheral's lock held, so a handler must not call back into it.
 
 Capabilities advertised in ACT_INFORMATION are plain properties, settable from a `.repl`:
 `ProtocolVersion`, `SupportedLlcs`, `MaxFramePayloadSize`, `SupportedPowerModes`, `MaxWindowSize`,
@@ -112,6 +134,28 @@ swp AcknowledgeInterrupt
 swp LastReceivedPayloadHex                  # payload of the most recent frame in
 swp.uicc EnqueueResponsePayloadHex "0102"   # queue what the UICC answers with
 swp.uicc RequestServiceWithData "AABB"      # DummySWPTarget: transmit unprompted
+```
+
+Every frame is traced, so the whole conversation is readable from the monitor without writing C#:
+
+```
+swp.uicc FrameTraceHex          # the rolling trace: direction, raw wire bytes, decoded name
+swp.uicc LastFrameOutHex        # raw on-wire image of the last frame out
+swp.uicc LastPayloadInHex       # decoded payload of the last frame in, control field included
+swp.uicc LastFrameIn            # its name, e.g. "ACT_POWER_MODE full power"
+swp.uicc FrameTraceDepth 0      # 0 disables recording; Last* stay live. Default 32
+swp.uicc ClearFrameTrace
+swp.uicc ExchangeFrameHex "7EC0011B7A7F"    # inject a raw frame, e.g. replaying a capture
+```
+
+A trace of a full activation looks like this — note that ACT and SHDLC frames land in the same log:
+
+```
+out  7E0101051000032EA47F      ACT_SYNC +5B
+in   7E02016B4C7F              ACT_POWER_MODE full power
+out  7E03D1937F                ACT_READY
+in   7EF882003E66DFC0          Reset +2B
+out  7EE6040012C97F            UnnumberedAcknowledgement +2B
 ```
 
 The data link layer is inspectable on its own, which is the quickest way to check a capture against
