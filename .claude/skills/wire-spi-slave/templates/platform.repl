@@ -3,7 +3,9 @@
 //   machine LoadPlatformDescription @path/to/this.repl
 
 // --- SPI master ------------------------------------------------------------------------------------
-spi: SPI.SimpleSPIController @ sysbus 0x40011000
+// No address: the controller has no register map, so it registers on the sysbus without claiming
+// any address space. The monitor still reaches it as sysbus.spi.
+spi: SPI.SimpleSPIController @ sysbus
 
 // --- Simple proprietary slave (SPI bus only) -------------------------------------------------------
 // Prefix "SPI." because the class lives in namespace ...Peripherals.SPI.

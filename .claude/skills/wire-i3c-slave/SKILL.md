@@ -75,7 +75,7 @@ with constructor parameters as indented `name: value` lines.
 Minimal master + proprietary slave:
 
 ```repl
-i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+i3c: I3C.SimpleI3CController @ sysbus
 
 slave: I3C.MyProprietaryI3CSlave @ i3c 0x08
     provisionedId: 0x1234567890AB
@@ -83,8 +83,13 @@ slave: I3C.MyProprietaryI3CSlave @ i3c 0x08
     deviceCharacteristics: 0xC5
 ```
 
-- The controller sits on the sysbus (it is `IKnownSize`); the slave registers on the **controller**
-  (`@ i3c 0x08`) at its I3C address.
+**The controller takes no address.** A bus controller here is not a block inside the SoC: it has no
+register map, so it is not `IDoubleWordPeripheral` and not `IKnownSize`, and it registers on the sysbus
+with **no address at all**. Giving it one would make the bus lie about what is actually memory-mapped.
+The monitor still reaches it as `sysbus.i3c`. Only a genuinely memory-mapped, firmware-driven
+model — ``InventedI3CTarget`` below — gets an address.
+
+- The slave registers on the **controller** (`@ i3c 0x08`) at its I3C address, not on the sysbus.
 - Constructor params are matched by name (case-insensitive). `ulong`/`byte` values are plain numbers.
 
 **Multi-registration** (a firmware-managed slave on both the sysbus and the I3C bus) uses the `@ { ... }`
@@ -119,7 +124,11 @@ i3c IRQ IsSet                               # IBI drives this GPIO
 
 **Monitor gotchas (all learned the hard way):**
 
-- **Quote hex/string args**, especially long ones: `WritePrivateHex 0x08 "DEAD..."`. An unquoted long
+- **Don't give the controller a sysbus address out of habit.** `I3C.SimpleI3CController @ sysbus 0x…` looks
+natural and is wrong: the controller has no register map. Only InventedI3CTarget, which really is
+memory-mapped, gets an address.
+
+**Quote hex/string args**, especially long ones: `WritePrivateHex 0x08 "DEAD..."`. An unquoted long
   token fails with *"Parameters did not match the signature"*.
 - **`byte[]` params are not monitor-friendly.** Expose `...Hex(int addr, string hex)` helpers (convert
   with `Misc.HexStringToByteArray`) for monitor/robot use; keep `byte[]` overloads for C# test-benches.
@@ -187,7 +196,8 @@ the GStreamer/GirCore packages).
 1. Subclass `SimpleI3CPeripheral` in namespace `...Peripherals.I3C`; override the hooks you need;
    field-initialize anything `Reset()` touches.
 2. (Firmware-managed) add `IDoubleWordPeripheral, IKnownSize`, a register map, and lock shared FIFOs.
-3. `.repl`: `I3C.<YourClass> @ i3c 0xADDR` (or `@ { sysbus 0x..; i3c 0x.. }`), with `I3C.SimpleI3CController @ sysbus 0x..`.
+3. `.repl`: `I3C.<YourClass> @ i3c 0xADDR` (or `@ { sysbus 0x..; i3c 0x.. }`), with
+   `I3C.SimpleI3CController @ sysbus` (no address - the controller has no register map).
 4. Drive from the monitor with `WritePrivateHex`/`ReadPrivateHex`/CCC/IBI helpers (quote args).
 5. Bridge: `CreateI3CTCPBridge` — `true` for a firmware/async slave, default for a synchronous one.
 6. Connect the Java client (`sendData`/`isDataAvailable`/`receiveData`); add a robot test.

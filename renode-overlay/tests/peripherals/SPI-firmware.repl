@@ -19,4 +19,4 @@ spitarget: SPI.InventedSPITarget @ {
         spi 0
     }
 
-spi: SPI.SimpleSPIController @ sysbus 0x40011000
+spi: SPI.SimpleSPIController @ sysbus

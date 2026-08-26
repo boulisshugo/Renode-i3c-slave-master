@@ -75,10 +75,16 @@ not busy-poll the bus. This is the deterministic replacement for the old poll-fo
 Minimal master + proprietary slave (registered by **chip-select index**):
 
 ```repl
-spi: SPI.SimpleSPIController @ sysbus 0x40011000
+spi: SPI.SimpleSPIController @ sysbus
 
 slave: SPI.MyProprietarySPISlave @ spi 0
 ```
+
+**The controller takes no address.** A bus controller here is not a block inside the SoC: it has no
+register map, so it is not `IDoubleWordPeripheral` and not `IKnownSize`, and it registers on the sysbus
+with **no address at all**. Giving it one would make the bus lie about what is actually memory-mapped.
+The monitor still reaches it as `sysbus.spi`. Only a genuinely memory-mapped, firmware-driven
+model — ``InventedSPITarget`` below — gets an address.
 
 **Multi-registration** (a firmware-managed slave on both the sysbus and the SPI bus) uses `@ { ... }` —
 see `templates/platform.repl` and `renode-overlay/tests/peripherals/SPI-firmware.repl`:
@@ -107,7 +113,11 @@ spi.slave0 LastReceivedHex                   # DummySPITarget: MOSI bytes of the
 
 **Monitor gotchas (learned the hard way on I3C, they apply here too):**
 
-- **Quote hex/string args**, especially long ones: `TransferHex 0 "DEAD…"`. Unquoted long tokens fail
+- **Don't give the controller a sysbus address out of habit.** `SPI.SimpleSPIController @ sysbus 0x…` looks
+natural and is wrong: the controller has no register map. Only InventedSPITarget, which really is
+memory-mapped, gets an address.
+
+**Quote hex/string args**, especially long ones: `TransferHex 0 "DEAD…"`. Unquoted long tokens fail
   with *"Parameters did not match the signature"*.
 - **`byte[]` params are not monitor-friendly.** Expose `…Hex(int cs, string hex)` helpers; keep `byte[]`
   overloads for C# test-benches.
@@ -165,7 +175,8 @@ fails on the GStreamer/GirCore packages.)
 1. Subclass `SimpleSPIPeripheral` in namespace `...Peripherals.SPI`; override `OnTransfer`; field-initialize
    anything `Reset()` touches.
 2. (Firmware-managed) add `IDoubleWordPeripheral, IKnownSize`, a register map, and lock shared FIFOs.
-3. `.repl`: `SPI.<YourClass> @ spi <cs>` (or `@ { sysbus 0x..; spi <cs> }`), with `SPI.SimpleSPIController @ sysbus 0x..`.
+3. `.repl`: `SPI.<YourClass> @ spi <cs>` (or `@ { sysbus 0x..; spi <cs> }`), with
+   `SPI.SimpleSPIController @ sysbus` (no address - the controller has no register map).
 4. Drive from the monitor with `TransferHex` / interrupt helpers (quote args).
 5. Bridge: `CreateSPITCPBridge` — `true` for a firmware/async slave, default for a synchronous one;
    then `start` the emulation (transfers are marshalled into the time domain and only run while it does).

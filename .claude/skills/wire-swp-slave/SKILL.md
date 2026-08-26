@@ -5,6 +5,9 @@ description: Use when wiring a proprietary SWP (Single Wire Protocol, ETSI TS 10
 
 # Wiring a proprietary SWP slave in Renode
 
+For the same material as a standalone document the user can read outside a Claude session, see
+`SWP-INTEGRATION.md` at the repository root.
+
 This repo provides agnostic SWP models
 (`renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/`), built on a new
 `ISWPPeripheral` contract (`Activate` / `Deactivate` / `ExchangeFrame` / `FrameAvailable`):
@@ -99,10 +102,16 @@ private readonly object locker = new object();
 `...Peripherals.Mocks` is `Mocks.ClassName`. (Wrong prefix → `Error E04: Could not resolve type`.)
 
 ```repl
-swp:  SWP.SimpleSWPController @ sysbus 0x40012000
+swp:  SWP.SimpleSWPController @ sysbus
 
 uicc: SWP.MyProprietarySWPSlave @ swp 0
 ```
+
+**The controller takes no address.** The CLF is a separate chip on the far end of the SWP line, not a
+block inside the SoC: it has no register map, so it is not `IDoubleWordPeripheral` and not `IKnownSize`,
+and it registers on the sysbus with **no address at all**. Giving it one would make the bus lie about
+what is actually memory-mapped. The monitor still reaches it as `sysbus.swp`. Only a genuinely
+memory-mapped, firmware-driven UICC gets an address, via the multi-registration form below.
 
 Multi-registration (a firmware-managed UICC on both the sysbus and the SWP line) uses `@ { ... }`, the
 same as the I3C and SPI models:
@@ -169,7 +178,11 @@ swp ComputeFrameCrc "313233343536373839"   # -> 0x29B1, the CRC check value for 
 
 **Monitor gotchas (same as I3C/SPI):**
 
-- **Quote hex/string args**, especially long ones: `SendHex 0 "DEAD…"`. Unquoted long tokens fail with
+- **Don't give the controller a sysbus address out of habit.** `SWP.SimpleSWPController @ sysbus 0x…` looks
+natural and is wrong: the controller has no register map. Only a firmware-managed UICC, which really is
+memory-mapped, gets an address.
+
+**Quote hex/string args**, especially long ones: `SendHex 0 "DEAD…"`. Unquoted long tokens fail with
   *"Parameters did not match the signature"*.
 - **`byte[]` params are not monitor-friendly.** Expose `…Hex(int line, string hex)` helpers; keep the
   `byte[]` overloads for C# test-benches.
@@ -230,6 +243,6 @@ fails on the GStreamer/GirCore packages.)
 3. (Firmware-managed) add `IDoubleWordPeripheral, IKnownSize`, a register map, lock shared FIFOs, and
    call `SendInformation(response)` on the commit register write.
 4. `.repl`: `SWP.<YourClass> @ swp <line>` (or `@ { sysbus 0x..; swp <line> }`), with
-   `SWP.SimpleSWPController @ sysbus 0x..`.
+   `SWP.SimpleSWPController @ sysbus` (no address - the controller has no register map).
 5. Drive from the monitor: `swp Activate <line>` first, then `SendHex` (quote args).
 6. Bridge: `CreateSWPTCPBridge` — `true` for a firmware/async slave; activate the line, then `start`.

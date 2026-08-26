@@ -111,13 +111,19 @@ The Infrastructure project globs its sources, so no `.csproj` edits are needed.
 ## Wiring in a platform (`.repl`)
 
 ```repl
-i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+i3c: I3C.SimpleI3CController @ sysbus
 
 slave0: I3C.DummyI3CSlave @ i3c 0x08
     provisionedId: 0x1234567890AB
     busCharacteristics: 0x02
     deviceCharacteristics: 0xC5
 ```
+
+**The controller takes no sysbus address.** A controller here models a bus master, not a block inside
+the SoC — it has no register map, so it is neither `IDoubleWordPeripheral` nor `IKnownSize` and claims
+no address space. The monitor still reaches it as `sysbus.i3c`. The only models in this repo that do
+take an address are `InventedI3CTarget` and `InventedSPITarget`, which really are memory-mapped and
+driven by CPU firmware. The same holds for the SPI and SWP controllers.
 
 ## Driving it from the monitor
 
@@ -291,6 +297,10 @@ a commit (which fires the interrupt), so a half-written response is never shifte
 
 ## SWP counterpart
 
+> **Integrating your own SWP device?** [`SWP-INTEGRATION.md`](SWP-INTEGRATION.md) is a step-by-step
+> guide with the exact paths: where to put your class, what to override, the `.repl`, the monitor
+> commands, how to read the raw frames, and what to change if your silicon differs from the profile.
+
 **SWP** (Single Wire Protocol, [ETSI TS 102 613](https://www.etsi.org/deliver/etsi_ts/102600_102699/102613/))
 is the one-wire link between a **CLF** (Contactless Front-end — the master) and a **UICC** (the slave)
 in an NFC-enabled handset. It is not a register bus like I3C or SPI, so the models here sit lower down:
@@ -354,12 +364,15 @@ SWP is point to point, but a CLF usually has more than one SWP line (one to the 
 embedded SE), so targets register by **SWP line number**:
 
 ```repl
-swp: SWP.SimpleSWPController @ sysbus 0x40012000
+swp: SWP.SimpleSWPController @ sysbus
 
 uicc: Mocks.DummySWPTarget @ swp 0
 
 ese: Mocks.DummySWPTarget @ swp 1
 ```
+
+As with the I3C and SPI controllers, the CLF takes **no sysbus address** — it is a separate chip with no
+register map, so claiming address space would misrepresent what is memory-mapped.
 
 ### Driving it from the monitor
 

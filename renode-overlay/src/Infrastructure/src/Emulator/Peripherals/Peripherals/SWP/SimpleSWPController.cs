@@ -11,7 +11,6 @@ using System.Linq;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Logging;
-using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.SWP
@@ -32,12 +31,13 @@ namespace Antmicro.Renode.Peripherals.SWP
     // SWP is point to point, but a CLF commonly has more than one SWP line (one to the UICC, one to
     // an embedded SE). Targets therefore register by SWP *line number*, like any Renode bus child:
     //
-    //     swp:  SWP.SimpleSWPController @ sysbus 0x40012000
+    //     swp:  SWP.SimpleSWPController @ sysbus
     //     uicc: SWP.SimpleSWPPeripheral @ swp 0
     //
-    // It is memory-mappable (with a no-op register window) only so it can sit on the sysbus like any
-    // other controller; it is not meant to model a specific SoC's CLF register interface.
-    public class SimpleSWPController : SimpleContainer<ISWPPeripheral>, IDoubleWordPeripheral, IKnownSize, INumberedGPIOOutput
+    // It registers on the sysbus WITHOUT an address. The CLF is a separate chip on the far end of the SWP line, not a block inside the SoC:
+    // it has no register map, so claiming an address range would be fiction and would make the bus
+    // lie about what is actually memory-mapped. The monitor still reaches it as `sysbus.<name>`.
+    public class SimpleSWPController : SimpleContainer<ISWPPeripheral>, INumberedGPIOOutput
     {
         public SimpleSWPController(IMachine machine) : base(machine)
         {
@@ -83,18 +83,6 @@ namespace Antmicro.Renode.Peripherals.SWP
                 links[line] = new Link();
             }
         }
-
-        // No-op register window - see the class summary.
-        public uint ReadDoubleWord(long offset)
-        {
-            return 0;
-        }
-
-        public void WriteDoubleWord(long offset, uint value)
-        {
-        }
-
-        public long Size => 0x100;
 
         public GPIO IRQ { get; }
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }

@@ -3,7 +3,9 @@
 //   (machine) swp Activate 0
 //   (machine) swp SendHex 0 "0102"
 
-swp: SWP.SimpleSWPController @ sysbus 0x40012000
+// No address: the CLF is a separate chip with no register map, so it registers on the sysbus
+// without claiming any address space. The monitor still reaches it as sysbus.swp.
+swp: SWP.SimpleSWPController @ sysbus
 
 uicc: SWP.MyProprietarySWPSlave @ swp 0
 

@@ -1,4 +1,4 @@
-spi: SPI.SpiControllerSeHal @ sysbus 0x40011000
+spi: SPI.SpiControllerSeHal @ sysbus
     pollingFrequency: 100000
 
 se: Mocks.SeHalMockTarget @ spi 0

@@ -1,4 +1,4 @@
-spi: SPI.SimpleSPIController @ sysbus 0x40011000
+spi: SPI.SimpleSPIController @ sysbus
 
 echo: Mocks.EchoSPIDevice @ spi 0
 

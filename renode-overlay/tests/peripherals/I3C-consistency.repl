@@ -1,4 +1,4 @@
-i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+i3c: I3C.SimpleI3CController @ sysbus
 
 echo: Mocks.EchoI3CDevice @ i3c 0x08
 

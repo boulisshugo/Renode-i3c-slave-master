@@ -1,4 +1,4 @@
-i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+i3c: I3C.SimpleI3CController @ sysbus
 
 slave0: Mocks.DummyI3CSlave @ i3c 0x08
     provisionedId: 0x1234567890AB
