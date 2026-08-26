@@ -75,7 +75,7 @@ not busy-poll the bus. This is the deterministic replacement for the old poll-fo
 Minimal master + proprietary slave (registered by **chip-select index**):
 
 ```repl
-spi: SPI.SimpleSPIController @ sysbus 0x40011000
+spi: SPI.SimpleSPIController @ sysbus
 
 slave: SPI.MyProprietarySPISlave @ spi 0
 ```
@@ -165,7 +165,8 @@ fails on the GStreamer/GirCore packages.)
 1. Subclass `SimpleSPIPeripheral` in namespace `...Peripherals.SPI`; override `OnTransfer`; field-initialize
    anything `Reset()` touches.
 2. (Firmware-managed) add `IDoubleWordPeripheral, IKnownSize`, a register map, and lock shared FIFOs.
-3. `.repl`: `SPI.<YourClass> @ spi <cs>` (or `@ { sysbus 0x..; spi <cs> }`), with `SPI.SimpleSPIController @ sysbus 0x..`.
+3. `.repl`: `SPI.<YourClass> @ spi <cs>` (or `@ { sysbus 0x..; spi <cs> }`), with
+   `SPI.SimpleSPIController @ sysbus` (no address - the controller has no register map).
 4. Drive from the monitor with `TransferHex` / interrupt helpers (quote args).
 5. Bridge: `CreateSPITCPBridge` — `true` for a firmware/async slave, default for a synchronous one;
    then `start` the emulation (transfers are marshalled into the time domain and only run while it does).

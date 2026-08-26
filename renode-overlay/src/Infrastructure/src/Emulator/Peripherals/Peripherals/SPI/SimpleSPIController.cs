@@ -11,7 +11,6 @@ using System.Linq;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Logging;
-using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.SPI
@@ -27,9 +26,10 @@ namespace Antmicro.Renode.Peripherals.SPI
     //   - a target's data-ready interrupt (for targets built on SimpleSPIPeripheral) is captured and
     //     drives the IRQ GPIO line.
     //
-    // It is memory-mappable (with a no-op register window) only so it can sit on the sysbus like any
-    // other controller; it is not meant to model a specific SoC's SPI register interface.
-    public class SimpleSPIController : SimpleContainer<ISPIPeripheral>, IDoubleWordPeripheral, IKnownSize, INumberedGPIOOutput
+    // It registers on the sysbus WITHOUT an address. A bus controller is not a block inside the SoC:
+    // it has no register map, so claiming an address range would be fiction and would make the bus
+    // lie about what is actually memory-mapped. The monitor still reaches it as `sysbus.<name>`.
+    public class SimpleSPIController : SimpleContainer<ISPIPeripheral>, INumberedGPIOOutput
     {
         public SimpleSPIController(IMachine machine) : base(machine)
         {
@@ -64,16 +64,6 @@ namespace Antmicro.Renode.Peripherals.SPI
             IRQ.Unset();
             LastInterruptChipSelect = -1;
             lastInterruptPayload = new byte[0];
-        }
-
-        // No-op register window - see the class summary.
-        public uint ReadDoubleWord(long offset)
-        {
-            return 0;
-        }
-
-        public void WriteDoubleWord(long offset, uint value)
-        {
         }
 
         // Assert chip select for the given target. If the target implements ISelectableSPIPeripheral,
@@ -146,8 +136,6 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             IRQ.Unset();
         }
-
-        public long Size => 0x100;
 
         public GPIO IRQ { get; }
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }

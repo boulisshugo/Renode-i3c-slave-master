@@ -20,4 +20,4 @@ i3ctarget: I3C.InventedI3CTarget @ {
     }
     provisionedId: 0x1122334455
 
-i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+i3c: I3C.SimpleI3CController @ sysbus

@@ -111,7 +111,7 @@ The Infrastructure project globs its sources, so no `.csproj` edits are needed.
 ## Wiring in a platform (`.repl`)
 
 ```repl
-i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+i3c: I3C.SimpleI3CController @ sysbus
 
 slave0: I3C.DummyI3CSlave @ i3c 0x08
     provisionedId: 0x1234567890AB
@@ -358,7 +358,7 @@ SWP is point to point, but a CLF usually has more than one SWP line (one to the 
 embedded SE), so targets register by **SWP line number**:
 
 ```repl
-swp: SWP.SimpleSWPController @ sysbus 0x40012000
+swp: SWP.SimpleSWPController @ sysbus
 
 uicc: Mocks.DummySWPTarget @ swp 0
 

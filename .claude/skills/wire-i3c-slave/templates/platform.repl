@@ -3,7 +3,7 @@
 //   machine LoadPlatformDescription @path/to/this.repl
 
 // --- I3C master ------------------------------------------------------------------------------------
-i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+i3c: I3C.SimpleI3CController @ sysbus
 
 // --- Simple proprietary slave (I3C bus only) -------------------------------------------------------
 // Prefix "I3C." because the class lives in namespace ...Peripherals.I3C.

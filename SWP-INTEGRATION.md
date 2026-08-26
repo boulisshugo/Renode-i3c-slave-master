@@ -184,7 +184,7 @@ These are plain properties, settable in the constructor **or from the `.repl`**:
 ## Step 2 — write the platform file
 
 ```repl
-swp:  SWP.SimpleSWPController @ sysbus 0x40012000
+swp:  SWP.SimpleSWPController @ sysbus
 
 uicc: SWP.MyUicc @ swp 0
 ```
@@ -206,7 +206,7 @@ SWP is point to point, but a CLF commonly has more than one line (one to the UIC
 SE), so **the registration index is the SWP line number**:
 
 ```repl
-swp:  SWP.SimpleSWPController @ sysbus 0x40012000
+swp:  SWP.SimpleSWPController @ sysbus
 
 uicc: SWP.MyUicc @ swp 0
 ese:  SWP.MyEmbeddedSe @ swp 1
@@ -457,7 +457,7 @@ example in this repo does it that way.
    `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/`.
 2. Override `OnInformation`; field-initialize anything `Reset()` touches.
 3. Set `MaxFramePayloadSize` and `MaxWindowSize` to what your silicon accepts.
-4. Write the `.repl`: `SWP.SimpleSWPController @ sysbus 0x…` plus `SWP.YourClass @ swp <line>`.
+4. Write the `.repl`: `SWP.SimpleSWPController @ sysbus` (no address) plus `SWP.YourClass @ swp <line>`.
 5. If the ACT opcodes differ from the profile, edit the constants in `SWPProtocol.cs` — nothing else.
 6. `swp Activate <line>` **before** `SendHex`.
 7. Debug with `swp.<name> FrameTraceHex`.

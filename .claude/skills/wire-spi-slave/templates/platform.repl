@@ -3,7 +3,7 @@
 //   machine LoadPlatformDescription @path/to/this.repl
 
 // --- SPI master ------------------------------------------------------------------------------------
-spi: SPI.SimpleSPIController @ sysbus 0x40011000
+spi: SPI.SimpleSPIController @ sysbus
 
 // --- Simple proprietary slave (SPI bus only) -------------------------------------------------------
 // Prefix "SPI." because the class lives in namespace ...Peripherals.SPI.

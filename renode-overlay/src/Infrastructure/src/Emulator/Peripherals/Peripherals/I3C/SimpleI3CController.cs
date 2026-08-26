@@ -11,7 +11,6 @@ using System.Linq;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Logging;
-using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.I3C
@@ -26,9 +25,10 @@ namespace Antmicro.Renode.Peripherals.I3C
     //   - SendBroadcastCommandCode / SendDirectCommandCode issue CCCs,
     //   - In-Band Interrupts raised by targets are captured and drive the IRQ GPIO line.
     //
-    // It is memory-mappable (with a no-op register window) only so it can sit on the sysbus like any
-    // other controller; it is not meant to model a specific SoC's I3C register interface.
-    public class SimpleI3CController : SimpleContainer<II3CPeripheral>, IDoubleWordPeripheral, IKnownSize, INumberedGPIOOutput
+    // It registers on the sysbus WITHOUT an address. A bus controller is not a block inside the SoC:
+    // it has no register map, so claiming an address range would be fiction and would make the bus
+    // lie about what is actually memory-mapped. The monitor still reaches it as `sysbus.<name>`.
+    public class SimpleI3CController : SimpleContainer<II3CPeripheral>, INumberedGPIOOutput
     {
         public SimpleI3CController(IMachine machine) : base(machine)
         {
@@ -60,16 +60,6 @@ namespace Antmicro.Renode.Peripherals.I3C
             IRQ.Unset();
             LastInBandInterruptAddress = -1;
             lastInBandInterruptPayload = new byte[0];
-        }
-
-        // No-op register window - see the class summary.
-        public uint ReadDoubleWord(long offset)
-        {
-            return 0;
-        }
-
-        public void WriteDoubleWord(long offset, uint value)
-        {
         }
 
         // Simplified ENTDAA: assign each registered target a dynamic address equal to its
@@ -160,8 +150,6 @@ namespace Antmicro.Renode.Peripherals.I3C
         {
             IRQ.Unset();
         }
-
-        public long Size => 0x100;
 
         public GPIO IRQ { get; }
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }

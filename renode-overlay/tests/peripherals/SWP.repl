@@ -1,6 +1,6 @@
 // A CLF (SWP master) with a UICC on SWP line 0 and a second SWP line for an embedded SE.
 // SWP itself is point to point; the registration index is the CLF's SWP line number.
-swp: SWP.SimpleSWPController @ sysbus 0x40012000
+swp: SWP.SimpleSWPController @ sysbus
 
 uicc: Mocks.DummySWPTarget @ swp 0
 

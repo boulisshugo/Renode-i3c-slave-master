@@ -102,7 +102,7 @@ private readonly object locker = new object();
 `...Peripherals.Mocks` is `Mocks.ClassName`. (Wrong prefix → `Error E04: Could not resolve type`.)
 
 ```repl
-swp:  SWP.SimpleSWPController @ sysbus 0x40012000
+swp:  SWP.SimpleSWPController @ sysbus
 
 uicc: SWP.MyProprietarySWPSlave @ swp 0
 ```
@@ -233,6 +233,6 @@ fails on the GStreamer/GirCore packages.)
 3. (Firmware-managed) add `IDoubleWordPeripheral, IKnownSize`, a register map, lock shared FIFOs, and
    call `SendInformation(response)` on the commit register write.
 4. `.repl`: `SWP.<YourClass> @ swp <line>` (or `@ { sysbus 0x..; swp <line> }`), with
-   `SWP.SimpleSWPController @ sysbus 0x..`.
+   `SWP.SimpleSWPController @ sysbus` (no address - the controller has no register map).
 5. Drive from the monitor: `swp Activate <line>` first, then `SendHex` (quote args).
 6. Bridge: `CreateSWPTCPBridge` — `true` for a firmware/async slave; activate the line, then `start`.

@@ -3,7 +3,7 @@
 //   (machine) swp Activate 0
 //   (machine) swp SendHex 0 "0102"
 
-swp: SWP.SimpleSWPController @ sysbus 0x40012000
+swp: SWP.SimpleSWPController @ sysbus
 
 uicc: SWP.MyProprietarySWPSlave @ swp 0
 

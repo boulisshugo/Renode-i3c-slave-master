@@ -75,7 +75,7 @@ with constructor parameters as indented `name: value` lines.
 Minimal master + proprietary slave:
 
 ```repl
-i3c: I3C.SimpleI3CController @ sysbus 0x40010000
+i3c: I3C.SimpleI3CController @ sysbus
 
 slave: I3C.MyProprietaryI3CSlave @ i3c 0x08
     provisionedId: 0x1234567890AB
@@ -187,7 +187,8 @@ the GStreamer/GirCore packages).
 1. Subclass `SimpleI3CPeripheral` in namespace `...Peripherals.I3C`; override the hooks you need;
    field-initialize anything `Reset()` touches.
 2. (Firmware-managed) add `IDoubleWordPeripheral, IKnownSize`, a register map, and lock shared FIFOs.
-3. `.repl`: `I3C.<YourClass> @ i3c 0xADDR` (or `@ { sysbus 0x..; i3c 0x.. }`), with `I3C.SimpleI3CController @ sysbus 0x..`.
+3. `.repl`: `I3C.<YourClass> @ i3c 0xADDR` (or `@ { sysbus 0x..; i3c 0x.. }`), with
+   `I3C.SimpleI3CController @ sysbus` (no address - the controller has no register map).
 4. Drive from the monitor with `WritePrivateHex`/`ReadPrivateHex`/CCC/IBI helpers (quote args).
 5. Bridge: `CreateI3CTCPBridge` — `true` for a firmware/async slave, default for a synchronous one.
 6. Connect the Java client (`sendData`/`isDataAvailable`/`receiveData`); add a robot test.
