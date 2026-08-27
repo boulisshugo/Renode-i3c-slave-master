@@ -16,27 +16,47 @@ using Antmicro.Renode.Utilities;
 namespace Antmicro.Renode.Peripherals.SWP
 {
     // A simple, agnostic SWP master - the CLF (Contactless Front-end) side of an ETSI TS 102 613
-    // link. It is the counterpart of SimpleSWPPeripheral and speaks the same three layers:
+    // link. It is the counterpart of the target models and speaks the same three layers:
     //
     //   - data link layer (clause 8): every frame it sends is built by SWPFrame (SOF, bit-stuffed
     //     payload and CRC, EOF) and every frame it receives is decoded and CRC-checked;
-    //   - ACT LLC (clause 11): Activate() runs the activation sequence - it powers S1, receives the
-    //     UICC's ACT_SYNC + ACT_INFORMATION, answers ACT_POWER_MODE with the selected power mode,
-    //     and waits for ACT_READY. A corrupted or missing answer is retried by re-sending
-    //     ACT_POWER_MODE with the frame-resend (FR) bit set, exactly as the specification prescribes;
+    //   - ACT LLC (clause 11): Activate() powers S1 and then runs the activation sequence as the
+    //     target's frames arrive - ACT_SYNC in, ACT_POWER_MODE out, ACT_READY in;
     //   - SHDLC LLC (clause 10): after activation it establishes the link with RSET/UA (negotiating
     //     the window size and SREJ support), then carries data in modulo-8 sequenced I-frames,
     //     acknowledging with RR and recovering a lost frame with REJ.
+    //
+    // THE TARGET ANSWERS WHEN IT IS READY, NOT WHEN IT IS ASKED
+    //
+    // SWP is full duplex and point to point: the UICC drives S2 whenever it has something to say. On
+    // a target whose ACT and SHDLC layers are firmware (InventedSWPTarget), that is not a nicety but
+    // the only possibility - the firmware does not even run until the receiving slot is over, so no
+    // answer can ride the frame that asked for it.
+    //
+    // This controller is therefore EVENT-DRIVEN. Whether a frame comes back in the same slot
+    // (ExchangeFrame) or later on the target's own initiative (FrameAvailable), it goes through the
+    // same path and advances the same state machine. Which means:
+    //
+    //   - Activate(line) returns true only if the link came up within the call, which happens with a
+    //     host-side stack (SoftwareSWPTarget) that answers in-slot. With a firmware-managed target it
+    //     returns false and activation continues as the firmware answers: poll IsLinkEstablished(line)
+    //     while the emulation runs, rather than treating false as a failure.
+    //   - Send(line, ...) returns the answer only when it arrives in-slot. Otherwise it arrives later
+    //     and is published through the PayloadReceived event, LastReceivedPayloadHex and the IRQ.
+    //
+    // Nothing here ever spins or sleeps: an exchange is a call into the target and a return, so the
+    // CPU keeps running and simulation time keeps advancing between a question and its answer.
     //
     // SWP is point to point, but a CLF commonly has more than one SWP line (one to the UICC, one to
     // an embedded SE). Targets therefore register by SWP *line number*, like any Renode bus child:
     //
     //     swp:  SWP.SimpleSWPController @ sysbus
-    //     uicc: SWP.SimpleSWPPeripheral @ swp 0
+    //     uicc: SWP.SoftwareSWPTarget @ swp 0
     //
-    // It registers on the sysbus WITHOUT an address. The CLF is a separate chip on the far end of the SWP line, not a block inside the SoC:
-    // it has no register map, so claiming an address range would be fiction and would make the bus
-    // lie about what is actually memory-mapped. The monitor still reaches it as `sysbus.<name>`.
+    // It registers on the sysbus WITHOUT an address. The CLF is a separate chip on the far end of the
+    // SWP line, not a block inside the SoC: it has no register map, so claiming an address range would
+    // be fiction and would make the bus lie about what is actually memory-mapped. The monitor still
+    // reaches it as `sysbus.<name>`.
     public class SimpleSWPController : SimpleContainer<ISWPPeripheral>, INumberedGPIOOutput
     {
         public SimpleSWPController(IMachine machine) : base(machine)
@@ -95,6 +115,8 @@ namespace Antmicro.Renode.Peripherals.SWP
         public SWPPowerMode PowerMode { get; set; } = SWPPowerMode.FullPower;
 
         // How many times the CLF re-sends ACT_POWER_MODE with FR = 1 before giving up on activation.
+        // Only the in-slot answers of a host-side stack can be retried inside Activate(); with a
+        // firmware-managed target, use RetryActivation(line) when the firmware has gone quiet.
         public int ActivationRetries { get; set; } = 3;
 
         // SHDLC window size the CLF proposes in RSET.
@@ -103,8 +125,10 @@ namespace Antmicro.Renode.Peripherals.SWP
         // Whether the CLF offers selective reject in RSET.
         public bool SelectiveRejectSupport { get; set; } = SWPProtocol.DefaultSelectiveRejectSupport;
 
-        // Runs the full interface activation on one SWP line: S1 up, ACT_SYNC in, ACT_POWER_MODE out,
-        // ACT_READY in, then the SHDLC RSET/UA handshake. Returns true once data can flow.
+        // Powers S1 on one SWP line and starts the activation sequence. Returns true if the link came
+        // all the way up inside this call - which needs a target that answers in-slot. A
+        // firmware-managed target returns false here and finishes the sequence as its firmware runs;
+        // watch IsLinkEstablished(line).
         public bool Activate(int line)
         {
             if(!TryGetTarget(line, out var target) || !TryGetLink(line, out var link))
@@ -114,66 +138,38 @@ namespace Antmicro.Renode.Peripherals.SWP
 
             link.Reset();
             link.State = SWPInterfaceState.Deactivated;
+            link.ActivationPending = true;
+            link.ActivationAttempts = 0;
 
-            // The UICC announces itself with ACT_SYNC as soon as the CLF starts driving S1.
-            if(!TryReceive(line, target.Activate(), out var sync) || sync.Length == 0
-                || sync[0] != SWPProtocol.ActSync)
+            // Drive S1. A target with a host-side stack hands back its ACT_SYNC right away; a
+            // firmware-managed one hands back nothing and answers on S2 once its firmware has run.
+            var opening = target.Activate();
+            if(opening != null && opening.Length > 0)
             {
-                this.Log(LogLevel.Warning, "Activation of SWP line {0} failed: no valid ACT_SYNC frame", line);
-                target.Deactivate();
-                return false;
+                link.AnswersInSlot = true;
             }
-            ParseActInformation(link, sync);
-            link.State = SWPInterfaceState.ActSync;
-            this.Log(LogLevel.Info,
-                "SWP line {0}: ACT_SYNC received (version {1}, LLCs {2}, max frame {3} bytes)",
-                line, link.TargetProtocolVersion, link.TargetSupportedLlcs, link.TargetMaxFramePayloadSize);
+            Deliver(line, link, opening);
 
-            // ACT_POWER_MODE selects the power mode. If the answer is lost or corrupted, ask the UICC
-            // to repeat its last ACT frame by setting FR - that is the spec's recovery mechanism.
-            byte[] ready = null;
-            var frameResend = false;
-            for(var attempt = 0; attempt <= Math.Max(0, ActivationRetries); attempt++)
+            // A target that has answered in-slot is one that can: if the sequence has stalled, the
+            // frame was lost rather than merely late, and the specification's recovery is to ask for
+            // it again with FR = 1. A target that has said nothing at all may simply not have run
+            // its firmware yet, and retrying at it would be shouting at a chip that is still booting.
+            while(!link.Established && link.ActivationPending && link.AnswersInSlot
+                && RetryActivation(line))
             {
-                link.State = SWPInterfaceState.ActPowerMode;
-                var answer = Exchange(line, target, SWPProtocol.BuildActPowerMode(PowerMode, frameResend));
-                if(TryReceive(line, answer, out var payload) && payload.Length > 0)
-                {
-                    if(payload[0] == SWPProtocol.ActReady)
-                    {
-                        ready = payload;
-                        break;
-                    }
-                    if(payload[0] == SWPProtocol.ActSync)
-                    {
-                        // The UICC repeated its last ACT frame because we asked it to; now that we
-                        // have it intact, ask for the power mode again without the FR bit.
-                        ParseActInformation(link, payload);
-                        frameResend = false;
-                        continue;
-                    }
-                }
-                // Nothing usable came back - ask the UICC to repeat its last ACT frame (FR = 1).
-                frameResend = true;
-                this.Log(LogLevel.Warning,
-                    "SWP line {0}: no ACT_READY (attempt {1}); re-sending ACT_POWER_MODE with FR = 1",
-                    line, attempt + 1);
             }
 
-            if(ready == null)
+            if(link.Established)
             {
-                this.Log(LogLevel.Warning, "Activation of SWP line {0} failed: no ACT_READY frame", line);
-                target.Deactivate();
-                link.State = SWPInterfaceState.Deactivated;
-                return false;
+                return true;
             }
-
-            // ACT_READY completes the sequence; the interface is now available for data transfer.
-            link.PowerMode = PowerMode;
-            link.State = SWPInterfaceState.Activated;
-            this.Log(LogLevel.Info, "SWP line {0} activated in {1} mode", line, PowerMode);
-
-            return EstablishLink(line, target, link);
+            if(link.ActivationPending)
+            {
+                this.Log(LogLevel.Info,
+                    "SWP line {0}: S1 is up, waiting for the target's ACT_SYNC (it answers when its firmware is ready)",
+                    line);
+            }
+            return false;
         }
 
         // Activates every registered SWP line. Convenience for the monitor and for platforms with a
@@ -184,6 +180,33 @@ namespace Antmicro.Renode.Peripherals.SWP
             {
                 Activate(line);
             }
+        }
+
+        // Asks the target to repeat its last ACT frame by re-sending ACT_POWER_MODE with FR = 1 -
+        // the recovery the specification prescribes when the CLF did not get an ACT frame intact.
+        // Returns false when the line is not mid-activation or the retry budget is spent.
+        public bool RetryActivation(int line)
+        {
+            if(!TryGetTarget(line, out var target) || !TryGetLink(line, out var link))
+            {
+                return false;
+            }
+            if(!link.ActivationPending || link.State == SWPInterfaceState.Deactivated)
+            {
+                this.Log(LogLevel.Warning, "SWP line {0}: no activation in progress to retry", line);
+                return false;
+            }
+            if(link.ActivationAttempts >= Math.Max(0, ActivationRetries))
+            {
+                this.Log(LogLevel.Warning, "SWP line {0}: activation retries exhausted", line);
+                return false;
+            }
+            link.ActivationAttempts++;
+            this.Log(LogLevel.Warning,
+                "SWP line {0}: no ACT_READY (attempt {1}); re-sending ACT_POWER_MODE with FR = 1",
+                line, link.ActivationAttempts);
+            SendPayload(line, link, target, SWPProtocol.BuildActPowerMode(PowerMode, true));
+            return true;
         }
 
         // Drives S1 low: the interface returns to DEACTIVATED and all link state is dropped.
@@ -206,8 +229,10 @@ namespace Antmicro.Renode.Peripherals.SWP
         // Data transfer (SHDLC LLC)
         // --------------------------------------------------------------------------------------
 
-        // Sends one LLC payload in an SHDLC I-frame and returns the payload the UICC answered with
-        // (empty when it only acknowledged with an RR). A REJ is honoured by retransmitting once.
+        // Sends one LLC payload in an SHDLC I-frame. Returns the payload the target answered with in
+        // the same slot, or an empty array - which means either a bare acknowledgement or, with a
+        // firmware-managed target, that the answer is still being built. A REJ is honoured by
+        // retransmitting once.
         public byte[] Send(int line, byte[] payload)
         {
             payload = payload ?? new byte[0];
@@ -229,23 +254,26 @@ namespace Antmicro.Renode.Peripherals.SWP
             }
 
             var sequence = link.SendSequence;
-            var answer = Exchange(line, target, SWPProtocol.BuildInformation(sequence, link.ReceiveSequence, payload));
             link.SendSequence = (sequence + 1) % SWPProtocol.SequenceModulo;
+            link.PendingReject = -1;
+            var delivered = SendPayload(line, link, target,
+                SWPProtocol.BuildInformation(sequence, link.ReceiveSequence, payload));
 
-            var result = ProcessResponse(line, link, answer, out var rejectSequence);
-            if(rejectSequence < 0)
+            if(link.PendingReject < 0)
             {
-                return result;
+                return delivered;
             }
 
             // A REJ asks for retransmission starting at its N(R). Resynchronise our send sequence to
             // it and send the frame again - blindly reusing the refused N(S) would just be rejected.
+            var rejectSequence = link.PendingReject;
+            link.PendingReject = -1;
             Retransmissions++;
             this.Log(LogLevel.Debug, "SWP line {0}: REJ received, retransmitting I-frame with N(S) = {1}",
                 line, rejectSequence);
             link.SendSequence = (rejectSequence + 1) % SWPProtocol.SequenceModulo;
-            answer = Exchange(line, target, SWPProtocol.BuildInformation(rejectSequence, link.ReceiveSequence, payload));
-            return ProcessResponse(line, link, answer, out _);
+            return SendPayload(line, link, target,
+                SWPProtocol.BuildInformation(rejectSequence, link.ReceiveSequence, payload));
         }
 
         // Monitor-friendly helper: send hex-encoded data, get the hex-encoded answer back.
@@ -254,23 +282,27 @@ namespace Antmicro.Renode.Peripherals.SWP
             return Misc.PrettyPrintCollectionHex(Send(line, Misc.HexStringToByteArray(hexPayload)));
         }
 
-        // Sends a bare RR - a poll that acknowledges what we have received and gives the UICC a slot
-        // in which to answer. Returns any payload it sends back.
+        // Sends a bare RR - a poll that acknowledges what we have received and gives the target a
+        // slot in which to answer. Returns any payload it sends back in that slot.
         public byte[] Poll(int line)
         {
             if(!TryGetTarget(line, out var target) || !TryGetLink(line, out var link) || !link.Established)
             {
                 return Nothing;
             }
-            var answer = Exchange(line, target,
+            return SendPayload(line, link, target,
                 SWPProtocol.BuildSupervisory(SWPProtocol.SupervisoryFrameType.ReceiveReady, link.ReceiveSequence));
-            return ProcessResponse(line, link, answer, out _);
         }
 
         public string PollHex(int line)
         {
             return Misc.PrettyPrintCollectionHex(Poll(line));
         }
+
+        // Raised whenever an I-frame payload from a target has been accepted, whichever way it
+        // arrived. The arguments are the SWP line and the application payload, control field
+        // stripped. Fired on the emulation thread that ran the exchange.
+        public event Action<int, byte[]> PayloadReceived;
 
         // --------------------------------------------------------------------------------------
         // Observable state
@@ -293,6 +325,13 @@ namespace Antmicro.Renode.Peripherals.SWP
 
         public bool LinkEstablished => IsLinkEstablished(0);
 
+        // True between Activate(line) and the link coming up - the window in which the CLF is
+        // waiting on the target's firmware.
+        public bool IsActivationPending(int line)
+        {
+            return TryGetLink(line, out var link) && link.ActivationPending;
+        }
+
         // SHDLC window size agreed on the line.
         public int GetWindowSize(int line)
         {
@@ -305,10 +344,10 @@ namespace Antmicro.Renode.Peripherals.SWP
             return TryGetLink(line, out var link) ? link.TargetMaxFramePayloadSize : 0;
         }
 
-        // SWP line the most recent unsolicited frame came from, or -1 if none since reset.
+        // SWP line the most recent frame came from, or -1 if none since reset.
         public int LastReceivedLine { get; private set; } = -1;
 
-        // Payload of the most recent frame received, hex-encoded (monitor-readable).
+        // Payload of the most recent I-frame received, hex-encoded (monitor-readable).
         public string LastReceivedPayloadHex => Misc.PrettyPrintCollectionHex(lastReceivedPayload);
 
         public int FramesSent { get; private set; }
@@ -370,102 +409,153 @@ namespace Antmicro.Renode.Peripherals.SWP
         }
 
         // --------------------------------------------------------------------------------------
+        // The one path every frame from a target takes
+        // --------------------------------------------------------------------------------------
 
-        private bool EstablishLink(int line, ISWPPeripheral target, Link link)
-        {
-            var reset = SWPProtocol.BuildUnnumbered(SWPProtocol.UnnumberedFrameModifier.Reset,
-                SWPProtocol.BuildResetParameters((byte)WindowSize, SelectiveRejectSupport));
-            if(!TryReceive(line, Exchange(line, target, reset), out var payload) || payload.Length == 0
-                || SWPProtocol.GetFrameKind(payload[0]) != SWPProtocol.ShdlcFrameKind.Unnumbered
-                || SWPProtocol.GetModifier(payload[0]) != SWPProtocol.UnnumberedFrameModifier.UnnumberedAcknowledgement)
-            {
-                this.Log(LogLevel.Warning, "SWP line {0}: the SHDLC RSET was not acknowledged with a UA", line);
-                return false;
-            }
-
-            link.WindowSize = payload.Length > 1 ? Math.Max(1, Math.Min(payload[1], WindowSize)) : WindowSize;
-            link.SendSequence = 0;
-            link.ReceiveSequence = 0;
-            link.Established = true;
-            this.Log(LogLevel.Info, "SWP line {0}: SHDLC link established (window {1})", line, link.WindowSize);
-            return true;
-        }
-
-        // Sends one LLC payload as a wire frame and returns the target's wire answer.
-        private byte[] Exchange(int line, ISWPPeripheral target, byte[] payload)
+        // Sends one LLC payload as a wire frame and feeds whatever comes back in the same slot into
+        // the state machine. Returns the application payload delivered by that answer, if any.
+        private byte[] SendPayload(int line, Link link, ISWPPeripheral target, byte[] payload)
         {
             FramesSent++;
             this.Log(LogLevel.Noisy, "SWP line {0}: sending control 0x{1:X2} with {2} payload byte(s)",
                 line, payload.Length > 0 ? payload[0] : 0, Math.Max(0, payload.Length - 1));
-            return target.ExchangeFrame(SWPFrame.Encode(payload));
+            var answer = target.ExchangeFrame(SWPFrame.Encode(payload));
+            if(answer != null && answer.Length > 0)
+            {
+                link.AnswersInSlot = true;
+            }
+            return Deliver(line, link, answer);
         }
 
-        // Decodes a wire frame from a target, counting CRC/framing errors.
-        private bool TryReceive(int line, byte[] wire, out byte[] payload)
+        // Decodes a wire frame from a target and dispatches it. Counts CRC/framing errors. Returns
+        // the application payload it carried, or an empty array.
+        private byte[] Deliver(int line, Link link, byte[] wire)
         {
-            payload = Nothing;
             if(wire == null || wire.Length == 0)
             {
-                return false;
+                return Nothing;
             }
-            if(!SWPFrame.TryDecode(wire, out payload, out var error))
+            if(!SWPFrame.TryDecode(wire, out var payload, out var error))
             {
                 CrcErrors++;
                 this.Log(LogLevel.Warning, "SWP line {0}: discarding a malformed frame: {1}", line, error);
-                payload = Nothing;
-                return false;
+                return Nothing;
             }
             FramesReceived++;
-            return true;
+            if(payload.Length == 0)
+            {
+                return Nothing;
+            }
+            return Dispatch(line, link, payload);
         }
 
-        // Handles the SHDLC frame a target sent back in the same slot. Sets rejectSequence to the
-        // N(R) of a REJ frame - the sequence number the target wants retransmitted - or to -1 when
-        // the target did not ask for a retransmission.
-        private byte[] ProcessResponse(int line, Link link, byte[] wire, out int rejectSequence)
+        // Advances the CLF state machine by one received payload, whichever layer it belongs to and
+        // whichever way it arrived. May send the next frame of a handshake, which recurses back
+        // here through SendPayload - bounded by the length of the activation sequence.
+        private byte[] Dispatch(int line, Link link, byte[] payload)
         {
-            rejectSequence = -1;
-            if(!TryReceive(line, wire, out var payload) || payload.Length == 0)
+            if(!TryGetTarget(line, out var target))
             {
                 return Nothing;
             }
 
-            var control = payload[0];
-            switch(SWPProtocol.GetFrameKind(control))
+            switch(payload[0])
             {
-            case SWPProtocol.ShdlcFrameKind.Supervisory:
-                var type = SWPProtocol.GetSupervisoryType(control);
-                if(type == SWPProtocol.SupervisoryFrameType.Reject)
-                {
-                    RejectsReceived++;
-                    rejectSequence = SWPProtocol.GetReceiveSequence(control);
-                }
-                else if(type == SWPProtocol.SupervisoryFrameType.ReceiveNotReady)
-                {
-                    this.Log(LogLevel.Warning, "SWP line {0}: the UICC signalled RNR (busy)", line);
-                }
-                return Nothing;
+            case SWPProtocol.ActSync:
+                // The target has come up and announced itself. It may do so at any time - after S1
+                // rises, or again because we asked it to repeat with FR = 1 - so this is accepted
+                // whenever it arrives rather than only in the state that expects it.
+                ParseActInformation(link, payload);
+                link.State = SWPInterfaceState.ActSync;
+                link.ActivationPending = true;
+                this.Log(LogLevel.Info,
+                    "SWP line {0}: ACT_SYNC received (version {1}, LLCs {2}, max frame {3} bytes); answering ACT_POWER_MODE",
+                    line, link.TargetProtocolVersion, link.TargetSupportedLlcs, link.TargetMaxFramePayloadSize);
+                link.State = SWPInterfaceState.ActPowerMode;
+                return SendPayload(line, link, target, SWPProtocol.BuildActPowerMode(PowerMode, false));
 
-            case SWPProtocol.ShdlcFrameKind.Information:
-                var sendSequence = SWPProtocol.GetSendSequence(control);
-                if(sendSequence != link.ReceiveSequence)
+            case SWPProtocol.ActReady:
+                if(!link.ActivationPending)
                 {
-                    this.Log(LogLevel.Warning, "SWP line {0}: out-of-sequence I-frame N(S) = {1}, expected {2}",
-                        line, sendSequence, link.ReceiveSequence);
+                    this.Log(LogLevel.Warning, "SWP line {0}: unexpected ACT_READY - no activation in progress", line);
                     return Nothing;
                 }
-                link.ReceiveSequence = (link.ReceiveSequence + 1) % SWPProtocol.SequenceModulo;
-                var information = new byte[payload.Length - 1];
-                Array.Copy(payload, 1, information, 0, information.Length);
-                lastReceivedPayload = information;
-                LastReceivedLine = line;
-                return information;
+                // ACT_READY completes the sequence; the interface is available for data transfer.
+                link.PowerMode = PowerMode;
+                link.State = SWPInterfaceState.Activated;
+                this.Log(LogLevel.Info, "SWP line {0} activated in {1} mode; establishing the SHDLC link", line, PowerMode);
+                return SendPayload(line, link, target, SWPProtocol.BuildUnnumbered(
+                    SWPProtocol.UnnumberedFrameModifier.Reset,
+                    SWPProtocol.BuildResetParameters((byte)WindowSize, SelectiveRejectSupport)));
 
-            default:
-                this.Log(LogLevel.Debug, "SWP line {0}: U-frame 0x{1:X2} received outside link establishment",
-                    line, control);
+            case SWPProtocol.ActPowerMode:
+                this.Log(LogLevel.Warning, "SWP line {0}: a target sent ACT_POWER_MODE, which is the CLF's frame", line);
                 return Nothing;
             }
+
+            switch(SWPProtocol.GetFrameKind(payload[0]))
+            {
+            case SWPProtocol.ShdlcFrameKind.Unnumbered:
+                return HandleUnnumbered(line, link, payload);
+            case SWPProtocol.ShdlcFrameKind.Supervisory:
+                return HandleSupervisory(line, link, payload[0]);
+            default:
+                return HandleInformation(line, link, payload);
+            }
+        }
+
+        private byte[] HandleUnnumbered(int line, Link link, byte[] payload)
+        {
+            if(SWPProtocol.GetModifier(payload[0]) != SWPProtocol.UnnumberedFrameModifier.UnnumberedAcknowledgement)
+            {
+                this.Log(LogLevel.Debug, "SWP line {0}: U-frame 0x{1:X2} received outside link establishment",
+                    line, payload[0]);
+                return Nothing;
+            }
+
+            // UA: the target accepted our RSET and echoed the parameters it will use.
+            link.WindowSize = payload.Length > 1 ? Math.Max(1, Math.Min(payload[1], WindowSize)) : WindowSize;
+            link.SendSequence = 0;
+            link.ReceiveSequence = 0;
+            link.Established = true;
+            link.ActivationPending = false;
+            link.State = SWPInterfaceState.Activated;
+            this.Log(LogLevel.Info, "SWP line {0}: SHDLC link established (window {1})", line, link.WindowSize);
+            return Nothing;
+        }
+
+        private byte[] HandleSupervisory(int line, Link link, byte control)
+        {
+            var type = SWPProtocol.GetSupervisoryType(control);
+            if(type == SWPProtocol.SupervisoryFrameType.Reject)
+            {
+                RejectsReceived++;
+                link.PendingReject = SWPProtocol.GetReceiveSequence(control);
+            }
+            else if(type == SWPProtocol.SupervisoryFrameType.ReceiveNotReady)
+            {
+                this.Log(LogLevel.Warning, "SWP line {0}: the UICC signalled RNR (busy)", line);
+            }
+            return Nothing;
+        }
+
+        private byte[] HandleInformation(int line, Link link, byte[] payload)
+        {
+            var sendSequence = SWPProtocol.GetSendSequence(payload[0]);
+            if(sendSequence != link.ReceiveSequence)
+            {
+                this.Log(LogLevel.Warning, "SWP line {0}: out-of-sequence I-frame N(S) = {1}, expected {2}",
+                    line, sendSequence, link.ReceiveSequence);
+                return Nothing;
+            }
+            link.ReceiveSequence = (link.ReceiveSequence + 1) % SWPProtocol.SequenceModulo;
+
+            var information = new byte[payload.Length - 1];
+            Array.Copy(payload, 1, information, 0, information.Length);
+            lastReceivedPayload = information;
+            LastReceivedLine = line;
+            PayloadReceived?.Invoke(line, information);
+            return information;
         }
 
         private void ParseActInformation(Link link, byte[] actSync)
@@ -490,8 +580,9 @@ namespace Antmicro.Renode.Peripherals.SWP
             }
         }
 
-        // A target transmitted on S2 on its own initiative (SWP is full duplex). Decode it, advance
-        // the SHDLC receive sequence and raise the IRQ line so firmware or a test can react.
+        // A target transmitted on S2 on its own initiative - an ACT frame its firmware has just
+        // built, an answer to something we sent earlier, or an unsolicited I-frame. It goes through
+        // exactly the same state machine as an in-slot answer.
         private void HandleTargetFrame(ISWPPeripheral target, byte[] wire)
         {
             var line = ChildCollection.Where(x => ReferenceEquals(x.Value, target))
@@ -501,7 +592,7 @@ namespace Antmicro.Renode.Peripherals.SWP
                 return;
             }
 
-            var payload = ProcessResponse(line, link, wire, out _);
+            var payload = Deliver(line, link, wire);
             if(payload.Length == 0)
             {
                 return;
@@ -532,6 +623,10 @@ namespace Antmicro.Renode.Peripherals.SWP
             public void Reset()
             {
                 Established = false;
+                ActivationPending = false;
+                ActivationAttempts = 0;
+                AnswersInSlot = false;
+                PendingReject = -1;
                 SendSequence = 0;
                 ReceiveSequence = 0;
                 WindowSize = SWPProtocol.DefaultWindowSize;
@@ -545,6 +640,20 @@ namespace Antmicro.Renode.Peripherals.SWP
             public SWPInterfaceState State = SWPInterfaceState.Deactivated;
             public SWPPowerMode PowerMode = SWPPowerMode.LowPower;
             public bool Established;
+
+            // Set between Activate() and the link coming up: the window in which an ACT frame from
+            // the target is expected and the FR retry applies.
+            public bool ActivationPending;
+            public int ActivationAttempts;
+
+            // Set once this target has answered inside a slot. It tells a lost frame (retry now)
+            // apart from a target whose firmware has not answered yet (wait for it).
+            public bool AnswersInSlot;
+
+            // N(R) of a REJ seen while handling the current Send, or -1. Collected here because the
+            // REJ may arrive from a nested dispatch rather than as Send's own return value.
+            public int PendingReject = -1;
+
             public int SendSequence;
             public int ReceiveSequence;
             public int WindowSize = SWPProtocol.DefaultWindowSize;

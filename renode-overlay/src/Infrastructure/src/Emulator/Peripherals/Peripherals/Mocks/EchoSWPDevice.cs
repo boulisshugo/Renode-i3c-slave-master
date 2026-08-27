@@ -12,11 +12,11 @@ namespace Antmicro.Renode.Peripherals.Mocks
     // payload back. Because the answer is piggybacked on the very frame that acknowledges the
     // request, one Send by the CLF returns the original bytes - handy for end-to-end data-integrity
     // and consistency testing of the framing, the CRC and the sequencing.
-    public class EchoSWPDevice : SimpleSWPPeripheral
+    public class EchoSWPDevice : SoftwareSWPTarget
     {
-        protected override byte[] OnInformation(byte[] payload)
+        protected override byte[] OnInformation(byte[] information)
         {
-            return payload;
+            return information;
         }
     }
 }

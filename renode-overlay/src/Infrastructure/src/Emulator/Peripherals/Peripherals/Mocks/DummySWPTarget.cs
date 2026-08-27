@@ -14,10 +14,11 @@ namespace Antmicro.Renode.Peripherals.Mocks
 {
     // A ready-to-use mock SWP (UICC) target for testing a CLF and for quick wiring from the monitor.
     //
-    // It is a plain SimpleSWPPeripheral - so the ACT activation sequence and SHDLC come for free -
-    // plus introspection of what it received and monitor-friendly helpers to answer and to transmit
-    // on its own initiative. It is the SWP analog of DummyI3CSlave / DummySPITarget.
-    public class DummySWPTarget : SimpleSWPPeripheral
+    // It is a plain SoftwareSWPTarget - so the ACT activation sequence and SHDLC come from the
+    // host-side stack, there being no firmware in a mock to run them - plus introspection of what it
+    // received and monitor-friendly helpers to answer and to transmit on its own initiative. It is
+    // the SWP analog of DummyI3CSlave / DummySPITarget.
+    public class DummySWPTarget : SoftwareSWPTarget
     {
         public override void Reset()
         {
@@ -53,11 +54,11 @@ namespace Antmicro.Renode.Peripherals.Mocks
         // Raised for every I-frame payload delivered to the target.
         public event Action<byte[]> InformationReceived;
 
-        protected override byte[] OnInformation(byte[] payload)
+        protected override byte[] OnInformation(byte[] information)
         {
-            received.Add(payload);
-            InformationReceived?.Invoke(payload);
-            return base.OnInformation(payload);
+            received.Add(information);
+            InformationReceived?.Invoke(information);
+            return base.OnInformation(information);
         }
 
         private readonly List<byte[]> received = new List<byte[]>();

@@ -1,0 +1,24 @@
+mem: Memory.MappedMemory @ sysbus 0x80000000
+    size: 0x100000
+
+uart: UART.MiV_CoreUART @ sysbus 0x70001000
+    clockFrequency: 66000000
+
+cpu: CPU.RiscV32 @ sysbus
+    cpuType: "rv32imac"
+    timeProvider: clint
+
+clint: IRQControllers.CoreLevelInterruptor @ sysbus 0x02000000
+    frequency: 1000000
+    [0, 1] -> cpu@[3, 7]
+
+// The firmware-managed UICC: a memory-mapped register window on the sysbus (for the CPU firmware)
+// and an SWP target on swp line 0 (for the CLF). The ACT and SHDLC layers are NOT in this model -
+// they run in firmware-swp/main.c on the CPU above, which is the whole point of the split.
+uicc: SWP.InventedSWPTarget @ {
+        sysbus 0x90000000;
+        swp 0
+    }
+
+// The CLF. It has no register map of its own, so it takes no sysbus address.
+swp: SWP.SimpleSWPController @ sysbus

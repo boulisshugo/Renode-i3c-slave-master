@@ -30,11 +30,14 @@ namespace Antmicro.Renode.Peripherals.SWP
         //
         // - synchronous: the bytes the client sends become one SHDLC I-frame; whatever the UICC
         //   piggybacks on its acknowledgement is streamed straight back. This is the mode for a UICC
-        //   that answers within the frame it is answering (e.g. EchoSWPDevice).
-        // - forward-on-unsolicited-frame: for a UICC whose answer is not ready in that slot (a
-        //   firmware-managed target). The client's bytes are sent as an I-frame and nothing is
-        //   returned yet; when the UICC later transmits on S2 on its own initiative, that payload is
-        //   forwarded to the client. SWP is full duplex, so this needs no polling from the host.
+        //   that answers within the frame it is answering - which in practice means a host-side
+        //   stack (SoftwareSWPTarget, EchoSWPDevice), since firmware cannot answer that fast.
+        // - forward-on-unsolicited-frame: for a UICC whose answer is not ready in that slot - a
+        //   firmware-managed target (InventedSWPTarget), where the answer only exists once the
+        //   emulated CPU has run. The client's bytes are sent as an I-frame and nothing is returned
+        //   yet; when the UICC later transmits on S2 on its own initiative, the controller decodes
+        //   and sequence-checks that frame and the payload is forwarded to the client. SWP is full
+        //   duplex, so this needs no polling from the host.
         //
         // Determinism: every access the bridge makes to the controller and the target is marshalled
         // onto the emulation's time-domain thread (see SWPTCPBridge.HandleDataReceived). The CLF
@@ -76,15 +79,11 @@ namespace Antmicro.Renode.Peripherals.SWP
 
             if(forwardOnUnsolicitedFrame)
             {
-                target = controller.GetTarget(line);
-                if(target != null)
-                {
-                    target.FrameAvailable += HandleTargetFrame;
-                }
-                else
-                {
-                    this.Log(LogLevel.Warning, "No SWP target on line {0} to subscribe for unsolicited frames", line);
-                }
+                // Subscribe to the controller, not to the target: by the time the controller
+                // publishes a payload it has decoded the frame, checked its CRC and its N(S), and
+                // stripped the SHDLC control field - so the client gets exactly the application
+                // bytes, and an out-of-sequence or corrupt frame never reaches it.
+                controller.PayloadReceived += HandleControllerPayload;
             }
 
             server.Start(port);
@@ -95,9 +94,9 @@ namespace Antmicro.Renode.Peripherals.SWP
         public void Dispose()
         {
             server.DataBlockReceived -= HandleDataReceived;
-            if(target != null)
+            if(forwardOnUnsolicitedFrame)
             {
-                target.FrameAvailable -= HandleTargetFrame;
+                controller.PayloadReceived -= HandleControllerPayload;
             }
             server.Stop();
         }
@@ -132,23 +131,14 @@ namespace Antmicro.Renode.Peripherals.SWP
             ForwardToClient(answer);
         }
 
-        // Fired from the emulation thread when the UICC transmits a frame on its own initiative. The
-        // controller has already decoded and sequence-checked it; decode the payload out of the wire
-        // frame here so the client gets exactly the application bytes.
-        private void HandleTargetFrame(ISWPPeripheral source, byte[] wireFrame)
+        // Fired from the emulation thread when the controller has accepted an I-frame payload from a
+        // target - the answer a firmware-managed UICC built after the slot that asked for it.
+        private void HandleControllerPayload(int sourceLine, byte[] information)
         {
-            if(!SWPFrame.TryDecode(wireFrame, out var payload, out var error))
-            {
-                this.Log(LogLevel.Warning, "Bridge could not decode an unsolicited frame: {0}", error);
-                return;
-            }
-            if(payload.Length < 2
-                || SWPProtocol.GetFrameKind(payload[0]) != SWPProtocol.ShdlcFrameKind.Information)
+            if(sourceLine != line)
             {
                 return;
             }
-            var information = new byte[payload.Length - 1];
-            Array.Copy(payload, 1, information, 0, information.Length);
             ForwardToClient(information);
         }
 
@@ -167,7 +157,6 @@ namespace Antmicro.Renode.Peripherals.SWP
         private readonly IMachine machine;
         private readonly SocketServerProvider server;
         private readonly SimpleSWPController controller;
-        private readonly ISWPPeripheral target;
         private readonly int line;
         private readonly bool forwardOnUnsolicitedFrame;
     }

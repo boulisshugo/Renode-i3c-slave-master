@@ -3,7 +3,8 @@
 # Compiles the SWP models against a small set of Renode API stubs and runs them through the protocol
 # scenarios in SWPSelfTest.cs. This does NOT replace the robot suites - it does not exercise Renode
 # itself, the .repl loader or the monitor - but it type-checks the real sources and verifies the frame
-# codec and both state machines in a couple of seconds, with no Renode checkout and no .NET SDK.
+# codec, both state machines and the hardware/firmware split in a couple of seconds, with no Renode
+# checkout and no .NET SDK.
 #
 # Needs the Mono C# compiler:  apt-get install -y mono-mcs mono-runtime
 #

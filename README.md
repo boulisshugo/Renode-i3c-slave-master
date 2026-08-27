@@ -9,7 +9,9 @@ into, and a controller that can drive them from a C# test-bench, the Renode moni
 Most of this README describes the I3C models; the **SPI** counterpart mirrors them one-to-one — see the
 [SPI counterpart](#spi-counterpart) section and the `wire-spi-slave` skill. The **SWP** models are a
 closer-to-the-wire case: SWP's whole substance is its framing and link layer, so those are implemented
-for real — see [SWP counterpart](#swp-counterpart) and the `wire-swp-slave` skill.
+for real — and the protocol layers above them are deliberately left to the target's *firmware*, because
+that is where they live on real silicon. See [SWP counterpart](#swp-counterpart) and the
+`wire-swp-slave` skill.
 
 ## Why transaction-level (method calls) rather than raw SDA/SCL?
 
@@ -61,9 +63,11 @@ The SPI suites (`SPI*.robot`) mirror these one-to-one. The SWP suites cover the 
 bad-CRC rejection), the ACT activation sequence, SHDLC link establishment and window negotiation,
 sequenced transfer across the modulo-8 wrap, line isolation, unsolicited UICC frames and deactivation;
 `SWP-consistency.robot` checks byte-for-byte integrity for large payloads and for payloads that imitate
-the SOF/EOF flags, over both the direct API and the TCP bridge. `tools/swp-selftest/run.sh` additionally
-drives the SWP models through every protocol scenario in a couple of seconds without a Renode checkout
-(see [Self-test](#self-test-without-a-renode-checkout)).
+the SOF/EOF flags, over both the direct API and the TCP bridge; and `SWP-firmware.robot` runs the
+firmware-in-the-loop case — a RISC-V CPU whose C firmware builds every ACT and SHDLC frame, including a
+check that the peripheral activates *nothing* while the CPU is stopped. `tools/swp-selftest/run.sh`
+additionally drives the SWP models through every protocol scenario in a couple of seconds without a
+Renode checkout (see [Self-test](#self-test-without-a-renode-checkout)).
 
 ## The `II3CPeripheral` contract
 
@@ -313,13 +317,17 @@ SWP's behaviour actually lives, so a model that skipped it would not be modellin
 | `ISWPPeripheral.cs` | The UICC (slave) contract: `Activate` / `Deactivate` / `ExchangeFrame` / `FrameAvailable`, plus the interface-state enum. |
 | `SWPFrame.cs` | Data link layer codec (clause 8): SOF `7E`, bit stuffing, CRC-16, EOF `7F`. |
 | `SWPProtocol.cs` | The ACT and SHDLC control-field encodings and frame builders (clauses 10 and 11). |
-| `SimpleSWPPeripheral.cs` | Agnostic UICC base — ACT and SHDLC done for you, with `virtual` hooks to **subclass for proprietary logic**, and a raw-frame trace. |
+| `SimpleSWPPeripheral.cs` | The SWP **hardware**: framing, CRC, S1/S2 slots, raw-frame trace. Answers the CLF with **nothing** — the protocol is not its job. |
+| `InventedSWPTarget.cs` | Firmware-in-the-loop UICC: a memory-mapped register window (RX frames, TX + commit, ACT/DEACT interrupt) on top of that transport. |
+| `SoftwareSWPTarget.cs` | The transport plus `SWPTargetStack`, for models with no firmware in the simulation. **This is the one to subclass for proprietary C# logic.** |
+| `SWPTargetStack.cs` | The UICC-side ACT + SHDLC state machine as a plain class — the host-side stand-in for firmware, and the reference for a C port. |
 | `SWPFrameRecord.cs` | One traced frame: raw wire image, decoded payload, and a human-readable name. |
-| `SimpleSWPController.cs` | Agnostic CLF (master); a `SimpleContainer<ISWPPeripheral>` keyed by SWP line, running activation, link establishment and sequenced data transfer. |
+| `SimpleSWPController.cs` | Agnostic CLF (master); a `SimpleContainer<ISWPPeripheral>` keyed by SWP line, event-driven, running activation, link establishment and sequenced data transfer. |
 | `SWPTCPBridge.cs` | Raw TCP bridge: the client speaks application payloads, the framing and SHDLC happen inside the emulation. |
 | `Mocks/DummySWPTarget.cs` | Ready-to-use mock UICC (records payloads, transmits unprompted). |
 | `Mocks/EchoSWPDevice.cs` | Mock UICC that echoes each payload back (for consistency testing). |
-| `tests/peripherals/SWP*.robot` | Robot suites: per-feature and data consistency. |
+| `firmware-swp/main.c` | A complete SWP LLC layer in C — ACT, SHDLC and the register access — for the firmware-managed target. |
+| `tests/peripherals/SWP*.robot` | Robot suites: per-feature, data consistency, and firmware in the loop. |
 | `tools/swp-selftest/` | Stub-compiled self-test: the protocol scenarios in seconds, no Renode checkout. |
 
 ### The three layers
@@ -358,6 +366,29 @@ Data rides modulo-8 sequenced I-frames; the answer is either piggybacked on an I
 An out-of-sequence I-frame draws a `REJ`, and the sender resynchronises to the `REJ`'s N(R) and
 retransmits. All of this is exercised by the test suites.
 
+### Which side of the hardware/firmware line each layer is on
+
+The two LLC layers above are real, but on the target side **the peripheral does not run them**. On the
+chips these models stand in for, ACT and SHDLC are the target's *firmware*; the SWP contact is a
+transceiver. A model that answered `ACT_SYNC` by itself would be putting a frame on the wire that the
+firmware never sent, and would hide exactly the firmware bugs — a missing `ACT_READY`, a stale `N(R)`,
+a late `UA` — that the simulation exists to surface.
+
+So `SimpleSWPPeripheral` checks the CRC, hands the LLC payload up, and stays silent. Who answers is a
+choice you make in the `.repl`:
+
+| | `InventedSWPTarget` | `SoftwareSWPTarget` |
+|---|---|---|
+| ACT + SHDLC run | as firmware on the emulated CPU | in C#, in `SWPTargetStack` |
+| Registered on | `sysbus <addr>` **and** `swp <line>` | `swp <line>` |
+| For | firmware in the loop — the real case | mocks, benches, consistency suites |
+| `swp Activate 0` returns | `False`; the link comes up once the CPU has run | `True` |
+
+Because firmware only runs *after* the receiving slot is over, the answer never rides the frame that
+asked for it: `ExchangeFrame` returning empty is normal, `Activate` returning `False` means "S1 is up,
+waiting" (poll `IsLinkEstablished`), and `SendHex` returns `[]` with the payload arriving later through
+the controller's `PayloadReceived` event and IRQ line. The CLF model is written around that.
+
 ### Wiring in a platform (`.repl`)
 
 SWP is point to point, but a CLF usually has more than one SWP line (one to the UICC, one to an
@@ -372,7 +403,18 @@ ese: Mocks.DummySWPTarget @ swp 1
 ```
 
 As with the I3C and SPI controllers, the CLF takes **no sysbus address** — it is a separate chip with no
-register map, so claiming address space would misrepresent what is memory-mapped.
+register map, so claiming address space would misrepresent what is memory-mapped. The one thing in an
+SWP platform that legitimately takes an address is a firmware-managed UICC, which really is
+memory-mapped:
+
+```repl
+uicc: SWP.InventedSWPTarget @ {
+        sysbus 0x90000000;
+        swp 0
+    }
+
+swp: SWP.SimpleSWPController @ sysbus
+```
 
 ### Driving it from the monitor
 
@@ -413,14 +455,39 @@ every exchange is marshalled onto the machine's time domain
 the same simulation clock as the CPU and a run is reproducible regardless of host timing — which is why
 the emulation must be running.
 
-### Wiring a proprietary UICC
+### Firmware in the loop
 
-Subclass `SimpleSWPPeripheral` and override the hooks; ACT and SHDLC are already handled.
+`InventedSWPTarget` is usable as-is — the work is the firmware, and `firmware-swp/main.c` is a complete
+one to start from. Its register window: `STATUS` (`ACT_EVT`, `DEACT_EVT`, `RX_FRAME`, `POWERED`, and the
+byte count of the current frame), `STATUS_CLEAR`, `IRQ_ENABLE`, `RX_DATA`, `RX_NEXT`, `TX_DATA`,
+`TX_COMMIT`, `CONTROL`, `LLC_STATE`. `ACT_EVT` latches on S1 rising and interrupts the CPU; the firmware
+opens its LLC and pushes `ACT_SYNC`; a frame exists on S2 only after `TX_DATA`… `TX_COMMIT`.
+
+```
+(machine) machine LoadPlatformDescription @tests/peripherals/SWP-firmware.repl
+(machine) sysbus LoadELF @tests/peripherals/swp-firmware.elf
+(machine) swp Activate 0        # -> False: S1 is up, the CPU has not run yet
+(machine) start
+swp-firmware: ready
+swp-firmware: ACT_SYNC sent
+swp-firmware: ACT_READY sent (full power)
+swp-firmware: SHDLC link established
+(machine) swp IsLinkEstablished 0    # -> True, and every frame of it came from main.c
+```
+
+A bench that models the power-up order (VPS → S1 → the ACT event, with delays between) sets
+`AutoActivationEvent false` and places the edges itself with `SetS1` and `TriggerActEvent` /
+`TriggerDeactEvent`.
+
+### Wiring a proprietary UICC in C#
+
+When there is no firmware in the simulation, subclass `SoftwareSWPTarget` — the transport plus the
+host-side ACT/SHDLC stack — and override the hooks.
 
 ```csharp
 namespace Antmicro.Renode.Peripherals.SWP
 {
-    public class MyProprietaryUicc : SimpleSWPPeripheral
+    public class MyProprietaryUicc : SoftwareSWPTarget
     {
         public MyProprietaryUicc()
         {
@@ -429,9 +496,9 @@ namespace Antmicro.Renode.Peripherals.SWP
 
         // A well-sequenced I-frame arrived. Return a payload to answer with an I-frame (the
         // acknowledgement rides along), or null for a bare RR.
-        protected override byte[] OnInformation(byte[] payload)
+        protected override byte[] OnInformation(byte[] information)
         {
-            return HandleApdu(payload);
+            return HandleApdu(information);
         }
 
         protected override void OnLinkEstablished()

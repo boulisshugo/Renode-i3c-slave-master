@@ -30,6 +30,8 @@ if command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then
     cp "$HERE/firmware/i3c-firmware.elf" "$HERE/renode-overlay/tests/peripherals/"
     "$HERE/firmware-spi/build.sh"
     cp "$HERE/firmware-spi/spi-firmware.elf" "$HERE/renode-overlay/tests/peripherals/"
+    "$HERE/firmware-swp/build.sh"
+    cp "$HERE/firmware-swp/swp-firmware.elf" "$HERE/renode-overlay/tests/peripherals/"
 else
     echo "   (skipping - using the pre-built *-firmware.elf committed in the repo)"
 fi
@@ -63,6 +65,7 @@ echo ">> Running the I3C, SPI and SWP robot suites"
     tests/peripherals/SPI-firmware.robot \
     tests/peripherals/SWP.robot \
     tests/peripherals/SWP-consistency.robot \
+    tests/peripherals/SWP-firmware.robot \
     ${JAVA_SUITES} )
 
 echo ">> All done."

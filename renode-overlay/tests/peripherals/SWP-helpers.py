@@ -87,3 +87,24 @@ def swp_crc(hex_payload):
         for _ in range(8):
             crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
     return "0x%04X" % crc
+
+
+def bridge_sequential_reverse(port, count, size, timeout=10.0):
+    """Like bridge_sequential_echo, but for a UICC whose application reverses the request - which is
+    what firmware-swp/main.c does. A plain loopback would pass an echo check without the firmware
+    ever having looked at the bytes; reversing them proves it did. Returns the number of matches."""
+    count = int(count)
+    size = int(size)
+    timeout = float(timeout)
+    sock = _connect(port, timeout)
+    matched = 0
+    try:
+        for _ in range(count):
+            payload = os.urandom(size)
+            sock.sendall(payload)
+            data = _recv_n(sock, size, timeout)
+            if data == payload[::-1]:
+                matched += 1
+    finally:
+        sock.close()
+    return matched

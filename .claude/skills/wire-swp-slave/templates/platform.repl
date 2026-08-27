@@ -10,13 +10,19 @@ swp: SWP.SimpleSWPController @ sysbus
 uicc: SWP.MyProprietarySWPSlave @ swp 0
 
 // ---------------------------------------------------------------------------------------------
-// Firmware-managed variant: the UICC is registered on BOTH the sysbus (memory-mapped registers the
-// CPU firmware drives) and the SWP line (so the CLF can reach it). Needs the class to implement
-// IDoubleWordPeripheral and IKnownSize as well.
+// Firmware-managed variant - the one that matches real silicon, where the ACT and SHDLC layers run
+// in the target's firmware rather than in the model. The UICC is registered on BOTH the sysbus
+// (the register window the CPU firmware drives) and the SWP line (so the CLF can reach it).
+//
+// SWP.InventedSWPTarget is usable as-is; the work is the firmware. See firmware-swp/main.c for a
+// complete LLC layer in C, and tests/peripherals/SWP-firmware.repl for this platform filled in.
 // ---------------------------------------------------------------------------------------------
 //
 // mem: Memory.MappedMemory @ sysbus 0x80000000
 //     size: 0x100000
+//
+// uart: UART.MiV_CoreUART @ sysbus 0x70001000
+//     clockFrequency: 66000000
 //
 // cpu: CPU.RiscV32 @ sysbus
 //     cpuType: "rv32imac"
@@ -26,7 +32,7 @@ uicc: SWP.MyProprietarySWPSlave @ swp 0
 //     frequency: 1000000
 //     [0, 1] -> cpu@[3, 7]
 //
-// uicc: SWP.MyFirmwareManagedUicc @ {
+// uicc: SWP.InventedSWPTarget @ {
 //         sysbus 0x90000000;
 //         swp 0
 //     }
