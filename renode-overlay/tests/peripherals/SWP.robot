@@ -7,7 +7,7 @@ Resource                        ${RENODEKEYWORDS}
 Library                         ${CURDIR}/SWP-helpers.py
 
 *** Variables ***
-${BRIDGE_PORT}                  33669
+${BRIDGE_PORT}                  33665
 
 *** Keywords ***
 Create Machine
@@ -197,7 +197,7 @@ Should Warn On Access To A Missing SWP Line
     Create Log Tester           1
 
     Execute Command             swp Activate 7
-    Wait For Log Entry          No SWP target registered on line 7
+    Wait For Log Entry          No SWP target registered on interface 7
 
 # --------------------------------------------------------------------------------------------------
 # The UICC transmitting on its own initiative (SWP is full duplex)
@@ -212,7 +212,7 @@ Should Raise IRQ On An Unsolicited Frame From The UICC
 
     ${irq}=                     Execute Command  swp IRQ IsSet
     Should Be Equal             ${irq.strip()}  True
-    ${line}=                    Execute Command  swp LastReceivedLine
+    ${line}=                    Execute Command  swp LastReceivedInterface
     Should Be Equal As Numbers  ${line}  0
     ${payload}=                 Execute Command  swp LastReceivedPayloadHex
     Should Contain              ${payload}  [0x11, 0x22, 0x33]

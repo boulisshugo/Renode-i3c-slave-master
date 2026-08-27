@@ -10,3 +10,4 @@ output/
 # Java build output
 /java/out/
 /java-spi/out/
+/java-swp/out/

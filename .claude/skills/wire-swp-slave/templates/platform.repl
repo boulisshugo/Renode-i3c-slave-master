@@ -1,4 +1,5 @@
-// Minimal SWP platform: a CLF master with one proprietary UICC on SWP line 0.
+// Minimal SWP platform: a CLF master with one proprietary UICC on SWP interface 0.
+// SWP is a single wire, point to point - the index just selects which interface of this CLF.
 //
 //   (machine) swp Activate 0
 //   (machine) swp SendHex 0 "0102"
@@ -12,7 +13,7 @@ uicc: SWP.MyProprietarySWPSlave @ swp 0
 // ---------------------------------------------------------------------------------------------
 // Firmware-managed variant - the one that matches real silicon, where the ACT and SHDLC layers run
 // in the target's firmware rather than in the model. The UICC is registered on BOTH the sysbus
-// (the register window the CPU firmware drives) and the SWP line (so the CLF can reach it).
+// (the register window the CPU firmware drives) and the SWP interface (so the CLF can reach it).
 //
 // SWP.InventedSWPTarget is usable as-is; the work is the firmware. See firmware-swp/main.c for a
 // complete LLC layer in C, and tests/peripherals/SWP-firmware.repl for this platform filled in.

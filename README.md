@@ -65,9 +65,11 @@ sequenced transfer across the modulo-8 wrap, line isolation, unsolicited UICC fr
 `SWP-consistency.robot` checks byte-for-byte integrity for large payloads and for payloads that imitate
 the SOF/EOF flags, over both the direct API and the TCP bridge; and `SWP-firmware.robot` runs the
 firmware-in-the-loop case — a RISC-V CPU whose C firmware builds every ACT and SHDLC frame, including a
-check that the peripheral activates *nothing* while the CPU is stopped. `tools/swp-selftest/run.sh`
-additionally drives the SWP models through every protocol scenario in a couple of seconds without a
-Renode checkout (see [Self-test](#self-test-without-a-renode-checkout)).
+check that the peripheral activates *nothing* while the CPU is stopped; and `SWP-java.robot` runs the
+same thing with the CLF's protocol layers in a Java client too. `tools/swp-selftest/run.sh` drives the
+SWP models through every protocol scenario in a couple of seconds without a Renode checkout (see
+[Self-test](#self-test-without-a-renode-checkout)), and `java-swp/run-selftest.sh` does the same for the
+Java client, against an independent Python implementation of the target.
 
 ## The `II3CPeripheral` contract
 
@@ -322,12 +324,14 @@ SWP's behaviour actually lives, so a model that skipped it would not be modellin
 | `SoftwareSWPTarget.cs` | The transport plus `SWPTargetStack`, for models with no firmware in the simulation. **This is the one to subclass for proprietary C# logic.** |
 | `SWPTargetStack.cs` | The UICC-side ACT + SHDLC state machine as a plain class — the host-side stand-in for firmware, and the reference for a C port. |
 | `SWPFrameRecord.cs` | One traced frame: raw wire image, decoded payload, and a human-readable name. |
-| `SimpleSWPController.cs` | Agnostic CLF (master); a `SimpleContainer<ISWPPeripheral>` keyed by SWP line, event-driven, running activation, link establishment and sequenced data transfer. |
+| `SimpleSWPController.cs` | Agnostic CLF (master); a `SimpleContainer<ISWPPeripheral>` keyed by SWP interface index, event-driven, running activation, link establishment and sequenced data transfer. |
 | `SWPTCPBridge.cs` | Raw TCP bridge: the client speaks application payloads, the framing and SHDLC happen inside the emulation. |
 | `Mocks/DummySWPTarget.cs` | Ready-to-use mock UICC (records payloads, transmits unprompted). |
 | `Mocks/EchoSWPDevice.cs` | Mock UICC that echoes each payload back (for consistency testing). |
+| `SWPLpduBridge.cs` | LPDU TCP bridge: the client owns the **CLF's** ACT and SHDLC layers and the controller only frames what it is given. |
 | `firmware-swp/main.c` | A complete SWP LLC layer in C — ACT, SHDLC and the register access — for the firmware-managed target. |
-| `tests/peripherals/SWP*.robot` | Robot suites: per-feature, data consistency, and firmware in the loop. |
+| `java-swp/` | The same layer in Java, on the CLF side: `ClfStack` runs the activation sequence and SHDLC over the LPDU bridge. |
+| `tests/peripherals/SWP*.robot` | Robot suites: per-feature, data consistency, firmware in the loop, and Java-driven. |
 | `tools/swp-selftest/` | Stub-compiled self-test: the protocol scenarios in seconds, no Renode checkout. |
 
 ### The three layers
@@ -389,10 +393,35 @@ asked for it: `ExchangeFrame` returning empty is normal, `Activate` returning `F
 waiting" (poll `IsLinkEstablished`), and `SendHex` returns `[]` with the payload arriving later through
 the controller's `PayloadReceived` event and IRQ line. The CLF model is written around that.
 
+### The same split, applied to the CLF
+
+On a real front-end the CLF's ACT and SHDLC layers are host software too, so `SimpleSWPController` can
+step out of the way in exactly the same manner. Set `ProtocolOwner` to `External` and it stops
+interpreting anything — it powers S1, frames and CRCs the LPDUs it is handed, and publishes every LPDU
+it receives through `LpduReceived`. `CreateSWPLpduBridge` puts a TCP client in that seat, and
+`java-swp/` is one:
+
+```
+Java ClfStack   ──LPDU──▶ SimpleSWPController ══wire══ InventedSWPTarget ──LPDU──▶ firmware-swp/main.c
+(CLF ACT+SHDLC)            (framing, CRC)               (framing, CRC)              (target ACT+SHDLC)
+```
+
+Run end to end with `java-swp/run-integration.sh`. In that configuration Renode models the wire and
+nothing else: every ACT_SYNC, ACT_POWER_MODE, ACT_READY, RSET, UA and sequence number is built by the
+Java client or by the C firmware.
+
+An **LPDU** here is the LLC payload of an SWP frame — the control field and what follows it, before the
+SOF/stuffing/CRC/EOF go on. It is the natural unit for this split, because it is exactly what software
+owns and hardware does not touch.
+
 ### Wiring in a platform (`.repl`)
 
-SWP is point to point, but a CLF usually has more than one SWP line (one to the UICC, one to an
-embedded SE), so targets register by **SWP line number**:
+SWP is a single wire, point to point: nothing on it is addressed, and the specification has no notion
+of a numbered line. The index below is Renode plumbing — a `SimpleContainer` registers children by
+number, so something has to go in the `@ swp 0` slot. It is loosely backed by hardware, in that a CLF
+chip commonly has more than one SWP contact (one to the UICC, one to an embedded SE), each its own
+independent point-to-point interface; the index selects **which interface of this CLF**, and means
+nothing beyond that:
 
 ```repl
 swp: SWP.SimpleSWPController @ sysbus
@@ -439,7 +468,12 @@ The framing is inspectable on its own, which is the quickest way to check a capt
 (machine) swp ComputeFrameCrc "313233343536373839"     # -> 0x29B1, the CRC check value for "123456789"
 ```
 
-### TCP bridge
+### TCP bridges
+
+There are two, and they cut the stack at different heights.
+
+**Application bridge** — the client sends the bytes that go *inside* an I-frame, and the controller
+builds the ACT sequence, the RSET/UA handshake and the sequence numbers around them:
 
 ```
 (machine) swp Activate 0
@@ -447,6 +481,20 @@ The framing is inspectable on its own, which is the quickest way to check a capt
 (machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456 true   # forward-on-unsolicited-frame
 (machine) start
 ```
+
+**LPDU bridge** — the client sends whole LPDUs and owns the CLF's ACT and SHDLC layers; the controller
+adds nothing but the frame. Creating it sets `ProtocolOwner` to `External`:
+
+```
+(machine) emulation CreateSWPLpduBridge sysbus.swp 0 3457
+(machine) swp PowerUp 0                                          # S1 up, no protocol
+(machine) start
+```
+
+Unlike the application bridge, the LPDU bridge is **length-prefixed** (2-byte big-endian per LPDU, both
+directions). It has to be: TCP has no record boundaries and an LPDU boundary is load-bearing here — the
+control field is the first byte of one, so a client that let two run together would read a sequence
+number as a payload byte.
 
 The client speaks raw **application payloads** — the framing, the CRC and the SHDLC control byte are
 added and stripped inside the emulation, exactly as on a real link. As with the I3C and SPI bridges,

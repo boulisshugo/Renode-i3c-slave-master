@@ -1,6 +1,6 @@
 ---
 name: wire-swp-slave
-description: Use when wiring a proprietary SWP (Single Wire Protocol, ETSI TS 102 613) UICC/eSE slave to this repo's SWP models, connecting the SimpleSWPController CLF master to it, writing the .repl platform file, or hooking up a TCP client. Covers where the ACT/SHDLC protocol layer belongs (firmware via InventedSWPTarget, or the host-side SWPTargetStack via SoftwareSWPTarget), the register map and ACT_EVT/DEACT_EVT interrupt a firmware-managed target exposes, the transport hooks (OnPayloadReceived / TransmitPayload / SetS1) and the stack hooks (OnInformation / SendInformation / OnLinkEstablished), the frame codec (SOF/EOF, bit stuffing, CRC-16), monitor commands, the two TCP-bridge modes, and the Renode/monitor gotchas that bite in practice.
+description: Use when wiring a proprietary SWP (Single Wire Protocol, ETSI TS 102 613) UICC/eSE slave to this repo's SWP models, connecting the SimpleSWPController CLF master to it, writing the .repl platform file, or hooking up a TCP or Java client that owns the CLF's ACT/SHDLC layers itself. Covers where the ACT/SHDLC protocol layer belongs (firmware via InventedSWPTarget, or the host-side SWPTargetStack via SoftwareSWPTarget), the register map and ACT_EVT/DEACT_EVT interrupt a firmware-managed target exposes, the transport hooks (OnPayloadReceived / TransmitPayload / SetS1) and the stack hooks (OnInformation / SendInformation / OnLinkEstablished), the frame codec (SOF/EOF, bit stuffing, CRC-16), monitor commands, the three TCP-bridge modes (application, forward-on-unsolicited-frame, and the length-prefixed LPDU bridge whose client owns the CLF protocol), the java-swp client, and the Renode/monitor gotchas that bite in practice.
 ---
 
 # Wiring a proprietary SWP slave in Renode
@@ -23,8 +23,10 @@ This repo provides agnostic SWP models
 - `SWPTargetStack` — the UICC-side ACT + SHDLC state machine as a plain class; also the reference for a
   C port.
 - `SimpleSWPController` — the CLF (master), event-driven, a `SimpleContainer<ISWPPeripheral>` keyed by
-  SWP line.
-- `SWPTCPBridge` — bridges a UICC to a raw TCP socket.
+  SWP interface index.
+- `SWPTCPBridge` — bridges a UICC to a raw TCP socket, application payloads only.
+- `SWPLpduBridge` — bridges whole LPDUs, so the client owns the **CLF's** ACT and SHDLC layers
+  (`CreateSWPLpduBridge`, `ProtocolOwner = External`). `java-swp/` is a worked client for it.
 - Mocks: `DummySWPTarget` (records payloads, transmits unsolicited frames) and `EchoSWPDevice`
   (loopback), both `SoftwareSWPTarget`s.
 
@@ -35,15 +37,26 @@ model that invented them would hide exactly the firmware bugs you are simulating
 `InventedSWPTarget` (firmware does) or `SoftwareSWPTarget` (a host-side stack does, explicitly, because
 there is no firmware).
 
+The same rule applies at the other end: `SimpleSWPController` runs ACT and SHDLC by default, but on a
+real CLF those are host software too, so `ProtocolOwner = External` makes it a transceiver as well and
+the LPDU bridge hands the layers to a client. `java-swp/src/swp/ClfStack.java` is that client, and it is
+the mirror of `firmware-swp/main.c` at the other end of the wire.
+
+An **LPDU** is the LLC payload of an SWP frame: the control field and what follows it, before the
+SOF/stuffing/CRC/EOF go on. It is the unit both bridges' protocol-owning modes speak, because it is
+exactly what software owns and hardware never touches.
+
 Wiring has three steps: **(1)** pick a base and subclass it, **(2)** write the `.repl`, **(3)** drive
 the master.
 
 ## Key SWP facts (vs I3C and SPI)
 
 - **Point to point, full duplex, one wire.** The CLF drives S1 in the voltage domain, the UICC answers
-  on S2 in the current domain, both at once. There is no bus address and no chip select; the CLF's
-  registration index here is its **SWP line number** (a CLF often has one line to the UICC and one to
-  an embedded SE).
+  on S2 in the current domain, both at once. There is no bus address and no chip select — and no
+  numbered line either: nothing on an SWP wire is addressed. The registration index in a `.repl` is
+  Renode plumbing (a `SimpleContainer` keys children by number), loosely backed by the fact that a CLF
+  chip commonly has more than one SWP contact — one to the UICC, one to an embedded SE. It selects
+  **which interface of this CLF**, and nothing more.
 - **The CLF owns power.** Only the master can activate or deactivate the interface. Nothing the UICC
   does is meaningful until `Activate` has run.
 - **The link is framed and sequenced, unlike I3C/SPI.** Every exchange carries a real CRC-16 and real
@@ -74,7 +87,7 @@ picks it up automatically. A copy-paste start is in `templates/ProprietarySWPSla
 
 ### Firmware in the loop — `InventedSWPTarget`
 
-Usable as-is. Register it on the sysbus **and** the SWP line, point the firmware at the register window,
+Usable as-is. Register it on the sysbus **and** the SWP interface, point the firmware at the register window,
 and every frame on the wire comes from the firmware.
 
 | Offset | Name | Access | Meaning |
@@ -280,11 +293,14 @@ memory-mapped, gets an address.
 
 ---
 
-## Step 4 — Connect an external client via the TCP bridge
+## Step 4 — Connect an external client via a TCP bridge
+
+Two bridges, cutting the stack at different heights.
 
 ```
-emulation CreateSWPTCPBridge sysbus.swp 0 3456          # synchronous mode
-emulation CreateSWPTCPBridge sysbus.swp 0 3456 true     # forward-on-unsolicited-frame mode
+emulation CreateSWPTCPBridge sysbus.swp 0 3456          # application: synchronous mode
+emulation CreateSWPTCPBridge sysbus.swp 0 3456 true     # application: forward-on-unsolicited-frame
+emulation CreateSWPLpduBridge sysbus.swp 0 3457         # LPDU: the client owns the CLF protocol
 ```
 
 **Raw payloads in, raw payloads out.** The client speaks only application bytes: the SWP framing, the
@@ -304,6 +320,28 @@ Pick the mode by how the UICC produces its answer:
   bytes go out as an I-frame and nothing comes back yet; when the firmware later commits its answer, the
   controller decodes and sequence-checks that frame and forwards the payload. The bridge subscribes to
   the controller's `PayloadReceived`, so a corrupt or out-of-sequence frame never reaches the client.
+
+### The LPDU bridge — when the CLF's protocol is yours
+
+`CreateSWPLpduBridge` sets `ProtocolOwner` to `External` and the controller stops interpreting anything:
+it frames what it is given (`SendLpdu`) and publishes every LPDU it receives (`LpduReceived`), control
+field first. Drive S1 with `PowerUp` — `Activate` would run a protocol that is no longer the model's.
+
+```
+emulation CreateSWPLpduBridge sysbus.swp 0 3457
+swp PowerUp 0
+start
+```
+
+**The socket is length-prefixed here** (2 bytes big-endian, then the LPDU, both directions), unlike the
+raw application bridge. TCP has no record boundaries and an LPDU boundary is load-bearing — the control
+field is the first byte of one — and the frame's own SOF/EOF cannot delimit it because they are
+bit-stuffed and bit-packed, which would put the data link layer back in the client.
+
+`java-swp/` is a complete client: `ClfStack.activate()` waits for `ACT_SYNC`, sends `ACT_POWER_MODE`,
+takes `ACT_READY`, sends `RSET`, takes the `UA`; `ClfStack.send()` owns N(S)/N(R). If the client
+connects after Renode powered S1 — the usual race — it recovers the missed `ACT_SYNC` with the
+frame-resend bit rather than guessing, which is the specification's own mechanism.
 
 ## Build & test
 
@@ -338,5 +376,7 @@ fails on the GStreamer/GirCore packages.)
 5. Drive from the monitor: `swp Activate <line>` first, then `SendHex` (quote args). Against firmware,
    `start` and poll `IsLinkEstablished` rather than trusting `Activate`'s return value.
 6. Bridge: `CreateSWPTCPBridge` — `true` for a firmware-managed slave; activate the line, then `start`.
-7. `./tools/swp-selftest/run.sh` before anything else — it type-checks and runs the protocol scenarios
-   in seconds.
+7. If the CLF's protocol layer is yours too, `swp ProtocolOwner External` + `CreateSWPLpduBridge` +
+   `swp PowerUp <iface>`, and speak LPDUs — copy `java-swp/src/swp/ClfStack.java`.
+8. `./tools/swp-selftest/run.sh` and `./java-swp/run-selftest.sh` before anything else — they
+   type-check and run the protocol scenarios in seconds.

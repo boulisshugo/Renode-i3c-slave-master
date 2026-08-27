@@ -42,7 +42,7 @@ namespace Antmicro.Renode.Peripherals.SWP
     // the firmware only runs after the receiving slot is over, so an answer can never ride the frame
     // that asked for it. The CLF - SimpleSWPController - is written to expect exactly that.
     //
-    // Registered on both the sysbus (MMIO, for the firmware) and the SWP line (for the controller):
+    // Registered on both the sysbus (MMIO, for the firmware) and the SWP interface (for the controller):
     //
     //     uicc: SWP.InventedSWPTarget @ { sysbus 0x90000000; swp 0 }
     //

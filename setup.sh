@@ -48,9 +48,11 @@ JAVA_SUITES=""
 if command -v javac >/dev/null 2>&1; then
     "$HERE/java/build.sh"
     "$HERE/java-spi/build.sh"
+    "$HERE/java-swp/build.sh"
     export I3C_JAVA_CP="$HERE/java/out"
     export I3C_SPI_JAVA_CP="$HERE/java-spi/out"
-    JAVA_SUITES="tests/peripherals/I3C-java.robot tests/peripherals/SPI-java.robot"
+    export SWP_JAVA_CP="$HERE/java-swp/out"
+    JAVA_SUITES="tests/peripherals/I3C-java.robot tests/peripherals/SPI-java.robot tests/peripherals/SWP-java.robot"
 else
     echo "   (skipping Java bridge build - JDK not found)"
 fi
@@ -69,4 +71,5 @@ echo ">> Running the I3C, SPI and SWP robot suites"
     ${JAVA_SUITES} )
 
 echo ">> All done."
-echo ">> For standalone Java reliability runs: java/run-integration.sh and java-spi/run-integration.sh"
+echo ">> For standalone Java reliability runs: java/run-integration.sh, java-spi/run-integration.sh"
+echo ">> and java-swp/run-integration.sh (the SWP one puts the CLF's ACT and SHDLC layers in the Java client)"

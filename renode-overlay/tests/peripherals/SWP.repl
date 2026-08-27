@@ -1,5 +1,6 @@
-// A CLF (SWP master) with a UICC on SWP line 0 and a second SWP line for an embedded SE.
-// SWP itself is point to point; the registration index is the CLF's SWP line number.
+// A CLF (SWP master) with a UICC on SWP interface 0 and a second interface for an embedded SE.
+// SWP itself is a single wire, point to point: nothing on it is addressed. The registration index is
+// Renode plumbing that selects which SWP interface of this CLF a target hangs off.
 // The CLF has no register map, so it takes no sysbus address; it is still sysbus.swp to the monitor.
 swp: SWP.SimpleSWPController @ sysbus
 

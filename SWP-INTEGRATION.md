@@ -26,10 +26,11 @@ Both take a five-line `.repl`.
 7. [Step 4 — see the raw frames](#step-4--see-the-raw-frames)
 8. [Step 5 — connect an external program](#step-5--connect-an-external-program)
 9. [Firmware-managed UICC](#firmware-managed-uicc)
-10. [Matching your silicon](#matching-your-silicon)
-11. [Testing your model](#testing-your-model)
-12. [Gotchas that actually bite](#gotchas-that-actually-bite)
-13. [Checklist](#checklist)
+10. [The CLF's protocol layer, outside the model too](#the-clfs-protocol-layer-outside-the-model-too)
+11. [Matching your silicon](#matching-your-silicon)
+12. [Testing your model](#testing-your-model)
+13. [Gotchas that actually bite](#gotchas-that-actually-bite)
+14. [Checklist](#checklist)
 
 ---
 
@@ -89,7 +90,8 @@ overlay drops straight in.
 | `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPFrame.cs` | Frame codec: `Encode`, `TryDecode`, `ComputeCrc`, and the `Sof`/`Eof`/CRC constants. |
 | `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPProtocol.cs` | ACT and SHDLC control-field encodings, frame builders, and `Describe`. **Edit this if your opcodes differ.** |
 | `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPFrameRecord.cs` | One traced frame: raw wire image, decoded payload, direction, readable name. |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPTCPBridge.cs` | Raw TCP bridge and the `CreateSWPTCPBridge` monitor command. |
+| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPTCPBridge.cs` | Application TCP bridge and the `CreateSWPTCPBridge` monitor command. |
+| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPLpduBridge.cs` | LPDU TCP bridge and `CreateSWPLpduBridge`: the client owns the CLF's ACT and SHDLC layers. |
 
 ### Reference implementations to copy from
 
@@ -105,12 +107,13 @@ overlay drops straight in.
 
 | Path | What it is |
 |------|-----------|
-| `renode-overlay/tests/peripherals/SWP.repl` | A CLF with two UICCs, on SWP lines 0 and 1. |
+| `renode-overlay/tests/peripherals/SWP.repl` | A CLF with two UICCs, on SWP interfaces 0 and 1. |
 | `renode-overlay/tests/peripherals/SWP-consistency.repl` | A CLF with an echoing UICC. |
-| `renode-overlay/tests/peripherals/SWP-firmware.repl` | A RISC-V CPU, a UART and a firmware-managed UICC on the sysbus and on SWP line 0. |
+| `renode-overlay/tests/peripherals/SWP-firmware.repl` | A RISC-V CPU, a UART and a firmware-managed UICC on the sysbus and on SWP interface 0. |
 | `renode-overlay/tests/peripherals/SWP.robot` | Per-feature suite — copy a test case as a template. |
 | `renode-overlay/tests/peripherals/SWP-consistency.robot` | Data-integrity suite. |
 | `renode-overlay/tests/peripherals/SWP-firmware.robot` | Firmware-in-the-loop suite: activation driven from C, round-trips through the CPU. |
+| `renode-overlay/tests/peripherals/SWP-java.robot` | Both protocol layers outside the models: Java CLF, C firmware target. |
 | `renode-overlay/tests/peripherals/SWP-helpers.py` | Python helpers the robot suites use (TCP bridge client, hex utilities). |
 | `tools/swp-selftest/run.sh` | Compiles and exercises the models in seconds without a Renode checkout. |
 | `setup.sh` | Clones Renode, overlays these files, builds, runs the suites. |
@@ -163,7 +166,7 @@ First decide which base class you are on:
 ### 1a. Firmware in the loop
 
 Often you write **no C# at all**: `InventedSWPTarget` is usable as-is, and the work is the firmware.
-Register it on the sysbus and the SWP line (see [Step 2](#step-2--write-the-platform-file)), point your
+Register it on the sysbus and the SWP interface (see [Step 2](#step-2--write-the-platform-file)), point your
 firmware at the register window, and everything on the wire comes from your code.
 
 The register window (`Size = 0x100`):
@@ -318,7 +321,7 @@ swp:  SWP.SimpleSWPController @ sysbus
 uicc: SWP.MyUicc @ swp 0
 ```
 
-A firmware-managed one is registered **twice** — memory-mapped for the CPU, and on the SWP line for the
+A firmware-managed one is registered **twice** — memory-mapped for the CPU, and on the SWP interface for the
 CLF:
 
 ```repl
@@ -334,7 +337,7 @@ swp:  SWP.SimpleSWPController @ sysbus
 UART.
 
 **The controller takes no address, and that is deliberate.** The CLF is a separate chip on the far end
-of the SWP line, not a block inside the SoC. It has no register map, so `SimpleSWPController` is neither
+of the SWP wire, not a block inside the SoC. It has no register map, so `SimpleSWPController` is neither
 `IDoubleWordPeripheral` nor `IKnownSize`, and it registers on the sysbus with no address at all — giving
 it one would make the bus lie about what is actually memory-mapped, and would suggest firmware could
 reach it through registers, which it cannot. The monitor still addresses it as `sysbus.swp`.
@@ -355,8 +358,11 @@ or set it from the monitor instead:
 
 That monitor form is what `renode-overlay/tests/peripherals/SWP.robot` uses.
 
-SWP is point to point, but a CLF commonly has more than one line (one to the UICC, one to an embedded
-SE), so **the registration index is the SWP line number**:
+SWP is a single wire, point to point — nothing on it is addressed, and the specification has no
+numbered lines. The registration index is Renode plumbing: a `SimpleContainer` keys its children by
+number, so something must go in the `@ swp 0` slot. It is loosely backed by hardware, in that a CLF
+commonly has more than one SWP contact (one to the UICC, one to an embedded SE), each an independent
+point-to-point interface. **The index selects which interface of this CLF**, and nothing more:
 
 ```repl
 swp:  SWP.SimpleSWPController @ sysbus
@@ -567,8 +573,58 @@ The I3C and SPI counterparts in this repo follow the same pattern and are worth 
 - `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SPI/InventedSPITarget.cs`
 - `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/I3C/InventedI3CTarget.cs`
 
-> There is no `java-swp/` directory — the SWP side has no Java bridge client of its own. The TCP bridge
-> is protocol-agnostic raw bytes, so `java/` and `java-spi/` are the pattern if you want one.
+---
+
+## The CLF's protocol layer, outside the model too
+
+Everything above moves the *target's* ACT and SHDLC layers where they belong. The CLF's layers are host
+software on a real front-end, and `SimpleSWPController` can step out of the same way:
+
+```
+(machine) emulation CreateSWPLpduBridge sysbus.swp 0 3457   # sets ProtocolOwner to External
+(machine) swp PowerUp 0                                     # S1 up, no protocol run
+(machine) start
+```
+
+With `ProtocolOwner` at `External` the controller interprets nothing. It frames and CRCs the LPDUs it is
+given (`SendLpdu`), and publishes every LPDU it receives (`LpduReceived`), control field first. The ACT
+sequence, the RSET/UA handshake and the sequence numbers all belong to whoever is on the socket.
+
+| | `Controller` (default) | `External` |
+|---|---|---|
+| Drives activation | `Activate(iface)` runs the whole sequence | `PowerUp(iface)` raises S1, nothing more |
+| Sends data | `Send(iface, payload)` — an I-frame is built for you | `SendLpdu(iface, lpdu)` — you build it |
+| Receives | `PayloadReceived` (application bytes) | `LpduReceived` (whole LPDUs, every layer) |
+| Bridge | `CreateSWPTCPBridge` | `CreateSWPLpduBridge` |
+
+`java-swp/` is a complete client for that seat:
+
+| Path | What it is |
+|------|-----------|
+| `java-swp/src/swp/ClfStack.java` | The CLF's ACT and SHDLC layers — the mirror of `firmware-swp/main.c` at the other end |
+| `java-swp/src/swp/SWPProtocol.java` | The LPDU encodings, the Java twin of `SWPProtocol.cs` |
+| `java-swp/src/swp/LpduLink.java` | The socket transport and its length-prefix framing |
+| `java-swp/src/swp/Main.java` | Reliability harness: activate, then N checked round-trips |
+| `java-swp/run-selftest.sh` | Fast loop — encodings plus a live run against `tools/fake-uicc.py`, no Renode |
+| `java-swp/run-integration.sh` | The real thing: Java CLF ↔ Renode ↔ C firmware |
+
+```java
+try (LpduLink link = new LpduLink("127.0.0.1", 3457)) {
+    ClfStack clf = new ClfStack(link).fullPower(true).window(4, false);
+    clf.activate(5000, 3);                      // ACT_SYNC in, ACT_POWER_MODE out, ACT_READY, RSET, UA
+    byte[] answer = clf.send(request, 5000);    // an I-frame, N(S)/N(R) owned here
+}
+```
+
+**The socket is length-prefixed**, unlike the application bridge: 2 bytes big-endian, then the LPDU,
+both directions. TCP has no record boundaries and an LPDU boundary matters — the control field is the
+first byte of one — and the frame's own SOF/EOF cannot do the job because they are bit-stuffed and
+bit-packed, which would put the data link layer back in the client.
+
+**Activation races are normal and recoverable.** Renode usually powers S1 before the client connects, so
+the target's `ACT_SYNC` has already gone out. `ClfStack.activate` handles it the way the specification
+does: after the first silence it asks for the last ACT frame again with the frame-resend bit, and the
+target repeats it. Nothing special is needed on the Renode side.
 
 ---
 
@@ -632,20 +688,32 @@ The self-test covers the layering explicitly — a `Layering` section asserts th
 `Firmware` section drives an `InventedSWPTarget` through its registers from a stand-in firmware and
 checks that the CLF only gets an activated link once that firmware has run.
 
+**Fast loop for the Java CLF client.** `java-swp/run-selftest.sh` checks the LPDU encodings against the
+same golden values the C# side asserts, then runs the real `ClfStack` against `tools/fake-uicc.py` — an
+independent Python implementation of the target's ACT and SHDLC — covering activation, the frame-resend
+recovery and 400 sequenced round-trips. Seconds, and no Renode:
+
+```bash
+./java-swp/run-selftest.sh
+```
+
 **Full loop, inside Renode.** Copy a test case from `renode-overlay/tests/peripherals/SWP.robot`:
 
 ```bash
 ./renode-test tests/peripherals/SWP.robot \
               tests/peripherals/SWP-consistency.robot \
-              tests/peripherals/SWP-firmware.robot
+              tests/peripherals/SWP-firmware.robot \
+              tests/peripherals/SWP-java.robot        # needs SWP_JAVA_CP
+./java-swp/run-integration.sh                          # Java CLF <-> Renode <-> C firmware
 ```
 
-`setup.sh` runs all three suites (along with the I3C and SPI ones) at the end of a build.
+`setup.sh` runs all four suites (along with the I3C and SPI ones) at the end of a build.
 
-> **Status of the suites in this repo:** the self-test passes (101 checks) and `firmware-swp/` builds
-> with `riscv64-unknown-elf-gcc`. The robot suites have been written but not executed here, because
-> that needs a built Renode — run `./setup.sh` to confirm them in your environment before relying on
-> them.
+> **Status in this repo:** the C# self-test passes (118 checks), the Java self-test passes (encodings
+> plus 400 live round-trips against the Python fake UICC), and `firmware-swp/` builds with
+> `riscv64-unknown-elf-gcc`. The robot suites and `run-integration.sh` have been written but not
+> executed here, because they need a built Renode — run `./setup.sh` to confirm them in your
+> environment before relying on them.
 
 ---
 
@@ -716,7 +784,10 @@ example in this repo does it that way.
    than trusting `Activate`'s return value.
 7. Debug with `swp.<name> FrameTraceHex` — and `LlcState` for what the firmware thinks it is doing.
 8. External client: `CreateSWPTCPBridge` (add `true` for a firmware-managed target), then `start`.
-9. Test with `./tools/swp-selftest/run.sh`, then `./renode-test tests/peripherals/SWP*.robot`.
+9. If the CLF's protocol is yours too (a host stack, a driver, a Java app), set
+   `ProtocolOwner External`, drive S1 with `PowerUp`, and speak LPDUs — `java-swp/` is a worked client.
+10. Test with `./tools/swp-selftest/run.sh` and `./java-swp/run-selftest.sh`, then
+    `./renode-test tests/peripherals/SWP*.robot`.
 
 ---
 

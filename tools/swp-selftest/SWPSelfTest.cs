@@ -33,6 +33,7 @@ public static class SWPSelfTest
         Shdlc();
         Recovery();
         Firmware();
+        ExternalProtocol();
         FrameTrace();
         Console.WriteLine();
         Console.WriteLine(failures == 0 ? "ALL C# SCENARIOS PASS" : failures + " FAILURE(S)");
@@ -164,9 +165,9 @@ public static class SWPSelfTest
             Logged("the SHDLC link is not established"));
 
         Logger.Entries.Clear();
-        Check("a missing SWP line is refused", !unactivated.Activate(7));
+        Check("a missing SWP interface is refused", !unactivated.Activate(7));
         Check("  and it logs what the robot suite waits for",
-            Logged("No SWP target registered on line 7"));
+            Logged("No SWP target registered on interface 7"));
     }
 
     // ----------------------------------------------------------------------------------------
@@ -182,7 +183,7 @@ public static class SWPSelfTest
         uicc.RequestServiceWithData("112233");
         Check("an unsolicited UICC frame raises IRQ", clf.IRQ.IsSet);
         Check("  carrying the payload and the line",
-            clf.LastReceivedPayloadHex == "[0x11, 0x22, 0x33]" && clf.LastReceivedLine == 0);
+            clf.LastReceivedPayloadHex == "[0x11, 0x22, 0x33]" && clf.LastReceivedInterface == 0);
         clf.AcknowledgeInterrupt();
         Check("the interrupt can be acknowledged", !clf.IRQ.IsSet);
         uicc.EnqueueResponsePayloadHex("77");
@@ -480,6 +481,84 @@ public static class SWPSelfTest
         private const uint StatusDeactivationEvent = 1u << 1;
         private const uint StatusRxFrame = 1u << 2;
         private const int RxCountShift = 8;
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // The other end of the same split: the CLF's ACT and SHDLC layers living outside the model.
+    // Here the "external owner" is this test; over CreateSWPLpduBridge it is a TCP client, and
+    // java-swp/ is one. Either way the controller must frame what it is given and interpret nothing.
+    private static void ExternalProtocol()
+    {
+        Section("External CLF protocol (ProtocolOwner = External)");
+
+        var uicc = new DummySWPTarget();
+        var clf = Build(uicc);
+        clf.ProtocolOwner = SWPProtocolOwner.External;
+
+        var inbox = new List<byte[]>();
+        clf.LpduReceived += (_, lpdu) => inbox.Add(lpdu);
+
+        // S1 up. The controller must NOT start the ACT sequence off its own bat any more.
+        clf.PowerUp(0);
+        Check("the target's ACT_SYNC reaches the owner raw",
+            inbox.Count == 1 && inbox[0][0] == SWPProtocol.ActSync);
+        Check("  with the ACT_INFORMATION still attached", inbox[0].Length == 6);
+        Check("the controller answered nothing by itself", clf.FramesSent == 0);
+        Check("  and did not declare the link up", !clf.IsLinkEstablished(0));
+
+        // From here the owner drives every step, exactly as the Java client does.
+        inbox.Clear();
+        clf.SendLpdu(0, SWPProtocol.BuildActPowerMode(SWPPowerMode.FullPower, false));
+        Check("ACT_POWER_MODE from the owner draws ACT_READY",
+            inbox.Count == 1 && inbox[0][0] == SWPProtocol.ActReady);
+        Check("  and the power mode really reached the UICC", uicc.PowerMode == SWPPowerMode.FullPower);
+
+        inbox.Clear();
+        clf.SendLpdu(0, SWPProtocol.BuildUnnumbered(SWPProtocol.UnnumberedFrameModifier.Reset,
+            SWPProtocol.BuildResetParameters(4, false)));
+        Check("RSET from the owner draws a UA",
+            inbox.Count == 1
+                && SWPProtocol.GetFrameKind(inbox[0][0]) == SWPProtocol.ShdlcFrameKind.Unnumbered
+                && SWPProtocol.GetModifier(inbox[0][0]) == SWPProtocol.UnnumberedFrameModifier.UnnumberedAcknowledgement);
+        Check("  and the UICC considers the link established", uicc.LinkEstablished);
+
+        // Sequenced data, with N(S)/N(R) owned entirely by the caller.
+        uicc.EnqueueResponsePayloadHex("A1A2");
+        inbox.Clear();
+        clf.SendLpdu(0, SWPProtocol.BuildInformation(0, 0, Hex("DEAD")));
+        Check("an I-frame built by the owner is answered with one",
+            inbox.Count == 1 && SWPProtocol.GetFrameKind(inbox[0][0]) == SWPProtocol.ShdlcFrameKind.Information);
+        Check("  carrying the UICC's payload and its own sequence numbers",
+            inbox[0].Length == 3 && inbox[0][1] == 0xA1 && inbox[0][2] == 0xA2
+                && SWPProtocol.GetSendSequence(inbox[0][0]) == 0
+                && SWPProtocol.GetReceiveSequence(inbox[0][0]) == 1);
+        Check("  and it reached the UICC intact", uicc.LastReceivedPayloadHex == "[0xDE, 0xAD]");
+
+        // The FR = 1 recovery a late-connecting client depends on: it never saw ACT_SYNC, so it asks
+        // for the last ACT frame again rather than guessing.
+        var late = new DummySWPTarget();
+        var lateClf = Build(late);
+        lateClf.ProtocolOwner = SWPProtocolOwner.External;
+        lateClf.PowerUp(0);   // ACT_SYNC goes out before anyone is listening
+        var lateInbox = new List<byte[]>();
+        lateClf.LpduReceived += (_, lpdu) => lateInbox.Add(lpdu);
+        lateClf.SendLpdu(0, SWPProtocol.BuildActPowerMode(SWPPowerMode.FullPower, true));
+        Check("FR = 1 makes the UICC repeat the ACT_SYNC a late owner missed",
+            lateInbox.Count == 1 && lateInbox[0][0] == SWPProtocol.ActSync);
+
+        // Guard rails.
+        Check("an empty LPDU is refused", clf.SendLpdu(0, new byte[0]).Length == 0);
+        var unpowered = Build(new DummySWPTarget());
+        unpowered.ProtocolOwner = SWPProtocolOwner.External;
+        Logger.Entries.Clear();
+        unpowered.SendLpdu(0, SWPProtocol.BuildActReady());
+        Check("sending an LPDU before S1 is up is refused", Logged("cannot send an LPDU while S1 is low"));
+
+        // Switching back gives the self-contained behaviour again, unchanged.
+        var normal = Build(new EchoSWPDevice());
+        Check("ProtocolOwner defaults to Controller", normal.ProtocolOwner == SWPProtocolOwner.Controller);
+        Check("  and that path still runs the whole sequence itself", normal.Activate(0));
+        Check("  and still carries data", normal.SendHex(0, "1234") == "[0x12, 0x34]");
     }
 
     // ----------------------------------------------------------------------------------------

@@ -7,7 +7,7 @@ Resource                        ${RENODEKEYWORDS}
 Library                         ${CURDIR}/SWP-helpers.py
 
 *** Variables ***
-${BRIDGE_PORT}                  33670
+${BRIDGE_PORT}                  33674
 ${FIRMWARE}                     @tests/peripherals/swp-firmware.elf
 
 *** Keywords ***

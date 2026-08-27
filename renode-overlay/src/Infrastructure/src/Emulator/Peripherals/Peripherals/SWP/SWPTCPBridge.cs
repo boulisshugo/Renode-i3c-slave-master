@@ -45,14 +45,14 @@ namespace Antmicro.Renode.Peripherals.SWP
         // it, so a run is reproducible regardless of host socket timing - which is also why the
         // emulation must be running (`start`) for a bridge exchange to execute.
         public static void CreateSWPTCPBridge(this Emulation emulation, SimpleSWPController controller,
-            int line, int port, bool forwardOnUnsolicitedFrame = false, string name = "swpBridge")
+            int iface, int port, bool forwardOnUnsolicitedFrame = false, string name = "swpBridge")
         {
             if(port < 0 || port > 65535)
             {
                 throw new RecoverableException("Port must be between 0 and 65535");
             }
             emulation.ExternalsManager.AddExternal(
-                new SWPTCPBridge(controller, line, port, forwardOnUnsolicitedFrame), name);
+                new SWPTCPBridge(controller, iface, port, forwardOnUnsolicitedFrame), name);
         }
     }
 
@@ -61,11 +61,11 @@ namespace Antmicro.Renode.Peripherals.SWP
     [Transient]
     public class SWPTCPBridge : IExternal, IDisposable
     {
-        public SWPTCPBridge(SimpleSWPController controller, int line, int port,
+        public SWPTCPBridge(SimpleSWPController controller, int iface, int port,
             bool forwardOnUnsolicitedFrame = false)
         {
             this.controller = controller;
-            this.line = line;
+            this.iface = iface;
             this.forwardOnUnsolicitedFrame = forwardOnUnsolicitedFrame;
             // The machine that owns the controller - used to run every exchange inside its time domain.
             machine = controller.GetMachine();
@@ -73,7 +73,7 @@ namespace Antmicro.Renode.Peripherals.SWP
             server = new SocketServerProvider(telnetMode: false, serverName: "SWPBridge");
             // Read up to a full chunk per recv so a message is delivered as one block, not byte-by-byte.
             server.BufferSize = 4096;
-            server.ConnectionAccepted += _ => this.Log(LogLevel.Info, "TCP client connected on the SWP bridge for line {0}", line);
+            server.ConnectionAccepted += _ => this.Log(LogLevel.Info, "TCP client connected on the SWP bridge for interface {0}", iface);
             server.ConnectionClosed += () => this.Log(LogLevel.Info, "TCP client disconnected from the SWP bridge");
             server.DataBlockReceived += HandleDataReceived;
 
@@ -87,8 +87,8 @@ namespace Antmicro.Renode.Peripherals.SWP
             }
 
             server.Start(port);
-            this.Log(LogLevel.Info, "SWP TCP bridge for line {0} listening on port {1} ({2})",
-                line, port, forwardOnUnsolicitedFrame ? "forward-on-unsolicited-frame" : "synchronous");
+            this.Log(LogLevel.Info, "SWP TCP bridge for interface {0} listening on port {1} ({2})",
+                iface, port, forwardOnUnsolicitedFrame ? "forward-on-unsolicited-frame" : "synchronous");
         }
 
         public void Dispose()
@@ -111,8 +111,8 @@ namespace Antmicro.Renode.Peripherals.SWP
                 return;
             }
 
-            this.Log(LogLevel.Debug, "Bridge received {0} bytes from TCP for SWP line {1}: {2}",
-                data.Length, line, Misc.PrettyPrintCollectionHex(data));
+            this.Log(LogLevel.Debug, "Bridge received {0} bytes from TCP for SWP interface {1}: {2}",
+                data.Length, iface, Misc.PrettyPrintCollectionHex(data));
 
             machine.HandleTimeDomainEvent<byte[]>(DriveExchange, data, timeDomainInternalEvent: false);
         }
@@ -121,7 +121,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         // and, in synchronous mode, streams the payload the UICC piggybacked straight back.
         private void DriveExchange(byte[] data)
         {
-            var answer = controller.Send(line, data);
+            var answer = controller.Send(iface, data);
             if(forwardOnUnsolicitedFrame)
             {
                 // The response arrives later, when the UICC transmits on S2 by itself (see
@@ -135,7 +135,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         // target - the answer a firmware-managed UICC built after the slot that asked for it.
         private void HandleControllerPayload(int sourceLine, byte[] information)
         {
-            if(sourceLine != line)
+            if(sourceLine != iface)
             {
                 return;
             }
@@ -157,7 +157,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         private readonly IMachine machine;
         private readonly SocketServerProvider server;
         private readonly SimpleSWPController controller;
-        private readonly int line;
+        private readonly int iface;
         private readonly bool forwardOnUnsolicitedFrame;
     }
 }
