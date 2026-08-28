@@ -61,7 +61,7 @@ overlay drops straight in.
 |------|-----------|
 | `renode-overlay/src/Infrastructure/src/Emulator/Main/Peripherals/SWP/ISWPPeripheral.cs` | The target contract: `Powered`, `SetPower`, `Transfer`, `DataAvailable`. |
 | `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SimpleSWPPeripheral.cs` | **The class you subclass.** Transport endpoint with an `OnTransfer` hook and a raw byte trace. |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SimpleSWPController.cs` | The CLF (master). Owns power, carries bytes. Usually used as-is. |
+| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SimpleSWPController.cs` | The CLF (master). Holds one target, owns power, carries bytes. Usually used as-is. |
 | `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPTCPBridge.cs` | Transparent TCP bridge and the `CreateSWPTCPBridge` monitor command. |
 
 ### Reference implementations to copy from
@@ -78,7 +78,7 @@ overlay drops straight in.
 
 | Path | What it is |
 |------|-----------|
-| `renode-overlay/tests/peripherals/SWP.repl` | A CLF with two targets, on SWP lines 0 and 1. |
+| `renode-overlay/tests/peripherals/SWP.repl` | Two independent CLFs, each with its own target. |
 | `renode-overlay/tests/peripherals/SWP-consistency.repl` | A CLF with an echoing target. |
 | `renode-overlay/tests/peripherals/SWP.robot` | Per-feature suite — copy a test case as a template. |
 | `renode-overlay/tests/peripherals/SWP-consistency.robot` | Byte-integrity suite. |
@@ -176,22 +176,28 @@ own stack, exactly as you would on real hardware.
 ```repl
 swp:  SWP.SimpleSWPController @ sysbus
 
-uicc: SWP.MyUicc @ swp 0
+uicc: SWP.MyUicc @ swp
 ```
+
+**There is no line index.** SWP is point to point: one CLF, one wire, one target. Nothing on the wire
+is addressed, so the controller holds exactly one target and its API takes no line argument — the
+target registers with `@ swp` and nothing more. Registering a second target on the same controller is
+refused.
 
 **The controller takes no address, and that is deliberate.** The CLF is a separate chip on the far end
 of the SWP line, not a block inside the SoC. It has no register map, so it is neither
 `IDoubleWordPeripheral` nor `IKnownSize`, and it registers on the sysbus with no address at all. The
 monitor still addresses it as `sysbus.swp`.
 
-SWP is point to point, but a CLF commonly has more than one line (one to the UICC, one to an embedded
-SE), so **the registration index is the SWP line number**:
+A CLF with two SWP interfaces is **two controllers**, each with its own target — which is what the
+hardware is:
 
 ```repl
 swp:  SWP.SimpleSWPController @ sysbus
+uicc: SWP.MyUicc @ swp
 
-uicc: SWP.MyUicc @ swp 0
-ese:  SWP.MyEmbeddedSe @ swp 1
+swp2: SWP.SimpleSWPController @ sysbus
+ese:  SWP.MyEmbeddedSe @ swp2
 ```
 
 Load it with `machine LoadPlatformDescription @path/to/your.repl`.
@@ -201,20 +207,19 @@ Load it with `machine LoadPlatformDescription @path/to/your.repl`.
 ## Step 3 — drive it
 
 ```
-(machine) swp PowerUp 0                     # drives S1. No handshake, no bytes.
+(machine) swp PowerUp                     # drives S1. No handshake, no bytes.
 (machine) swp Powered                       # -> True
-(machine) swp TransferHex 0 "00A40004"      # one full-duplex slot -> what came back on S2
-(machine) swp ReceiveHex 0                  # empty S1 slot, giving the target a chance to talk
-(machine) swp PowerDown 0                   # S1 low; the target drops its session state
+(machine) swp TransferHex "00A40004"      # one full-duplex slot -> what came back on S2
+(machine) swp ReceiveHex                  # empty S1 slot, giving the target a chance to talk
+(machine) swp PowerDown                   # S1 low; the target drops its session state
 ```
 
 Useful state on the CLF:
 
 ```
-swp LastReceivedHex        swp LastReceivedLine
+swp LastReceivedHex        swp Powered
 swp BytesSent              swp BytesReceived
 swp IRQ IsSet              swp AcknowledgeInterrupt
-swp IsPowered 0            swp PowerUpAll
 ```
 
 **Power up first.** `Transfer` on an unpowered line logs *"is not powered"* and carries nothing. That
@@ -251,9 +256,9 @@ has been stripped, so you can decode it against a real capture byte for byte.
 `SWPTCPBridge` exposes the link over a raw TCP socket, transparently in both directions:
 
 ```
-(machine) swp PowerUp 0
-(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456          # synchronous
-(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456 true     # forward-on-unsolicited-data
+(machine) swp PowerUp
+(machine) emulation CreateSWPTCPBridge sysbus.swp 3456          # synchronous
+(machine) emulation CreateSWPTCPBridge sysbus.swp 3456 true     # forward-on-unsolicited-data
 (machine) start
 ```
 
@@ -363,8 +368,6 @@ to call from the monitor or a robot test; keep the `byte[]` version for C#.
 **Quote hex arguments in the monitor**, especially long ones: `TransferHex 0 "DEAD…"`. Unquoted long
 tokens fail with *"Parameters did not match the signature"*.
 
-**A negative `int` prints as `0xFFFFFFFF`.** Don't assert `== -1` on `LastReceivedLine`.
-
 **Don't give the controller a sysbus address out of habit.** It has no register map. Only a
 firmware-managed target gets an address, through the multi-registration form.
 
@@ -381,8 +384,9 @@ firmware-managed target gets an address, through the multi-registration form.
    `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/`.
 2. Override `OnTransfer` and put your protocol there; field-initialize anything `Reset()` touches.
 3. Reset your stack in `OnPowerChanged(false)`.
-4. Write the `.repl`: `SWP.SimpleSWPController @ sysbus` (no address) plus `SWP.YourClass @ swp <line>`.
-5. `swp PowerUp <line>` **before** `TransferHex`.
+4. Write the `.repl`: `SWP.SimpleSWPController @ sysbus` (no address) plus `SWP.YourClass @ swp`
+   (no line index). A second SWP interface is a second controller.
+5. `swp PowerUp` **before** `TransferHex`.
 6. Debug with `swp.<name> TraceHex`.
 7. External client: `CreateSWPTCPBridge`, power the line, then `start`.
 8. Test with `./tools/swp-selftest/run.sh`, then `./renode-test tests/peripherals/SWP*.robot`.

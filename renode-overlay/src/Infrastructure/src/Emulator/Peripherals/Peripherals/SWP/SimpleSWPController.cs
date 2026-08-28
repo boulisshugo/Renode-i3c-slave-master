@@ -10,6 +10,7 @@ using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
+using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Utilities;
 
@@ -18,56 +19,85 @@ namespace Antmicro.Renode.Peripherals.SWP
     // A simple, agnostic SWP master - the CLF (Contactless Front-end) side of an ETSI TS 102 613
     // link, modelled as a TRANSPORT.
     //
-    // It does two things, which are the two things the wire does: it owns the power state of each
-    // line, and it carries opaque bytes in both directions. It implements no framing, no CRC, no
-    // ACT activation sequence and no SHDLC - those layers belong to whatever is under test on
-    // either end. See ISWPPeripheral for the reasoning, and tools/swp-reference/ for a standalone
-    // implementation of them.
-    //
-    // In particular, note that PowerUp does NOT run an activation sequence. It drives S1 and
-    // nothing more; the ACT exchange, if the stack under test performs one, is just the first bytes
-    // to cross the wire afterwards.
-    //
-    // SWP is point to point, but a CLF commonly has more than one SWP line (one to the UICC, one to
-    // an embedded SE). Targets therefore register by SWP *line number*, like any Renode bus child:
+    // SWP is point to point: one CLF, one wire, one target. There is no addressing on the wire and
+    // nothing to select, so this controller holds exactly one target and its API takes no line or
+    // address argument. A CLF with two SWP interfaces is two controllers, each with its own target -
+    // that is what the hardware is, and it keeps every model here honest about the fact that a
+    // single wire connects exactly two endpoints.
     //
     //     swp:  SWP.SimpleSWPController @ sysbus
-    //     uicc: SWP.SimpleSWPPeripheral @ swp 0
+    //     uicc: SWP.SimpleSWPPeripheral @ swp
+    //
+    // It does the two things the wire does: it owns the power state, and it carries opaque bytes in
+    // both directions. It implements no framing, no CRC, no ACT activation sequence and no SHDLC -
+    // those layers belong to whatever is under test on either end. See ISWPPeripheral for the
+    // reasoning, and tools/swp-reference/ for a standalone implementation of them.
+    //
+    // In particular, PowerUp does NOT run an activation sequence. It drives S1 and nothing more; the
+    // ACT exchange, if the stack under test performs one, is just the first bytes to cross the wire.
     //
     // It registers on the sysbus WITHOUT an address. The CLF is a separate chip on the far end of
     // the SWP line, not a block inside the SoC: it has no register map, so claiming an address range
     // would be fiction and would make the bus lie about what is actually memory-mapped. The monitor
     // still reaches it as `sysbus.<name>`.
-    public class SimpleSWPController : SimpleContainer<ISWPPeripheral>, INumberedGPIOOutput
+    public class SimpleSWPController :
+        IPeripheral, IPeripheralContainer<ISWPPeripheral, NullRegistrationPoint>, INumberedGPIOOutput
     {
-        public SimpleSWPController(IMachine machine) : base(machine)
+        public SimpleSWPController(IMachine machine)
         {
+            this.machine = machine;
             IRQ = new GPIO();
             Connections = new Dictionary<int, IGPIO> { { 0, IRQ } };
         }
 
-        public override void Register(ISWPPeripheral peripheral, NumberRegistrationPoint<int> registrationPoint)
-        {
-            base.Register(peripheral, registrationPoint);
-            Action<ISWPPeripheral, byte[]> handler = HandleTargetData;
-            dataHandlers[peripheral] = handler;
-            peripheral.DataAvailable += handler;
-        }
+        // --------------------------------------------------------------------------------------
+        // The single target on the wire
+        // --------------------------------------------------------------------------------------
 
-        public override void Unregister(ISWPPeripheral peripheral)
+        public void Register(ISWPPeripheral peripheral, NullRegistrationPoint registrationPoint)
         {
-            if(dataHandlers.TryGetValue(peripheral, out var handler))
+            if(target != null)
             {
-                peripheral.DataAvailable -= handler;
-                dataHandlers.Remove(peripheral);
+                throw new RegistrationException(
+                    "SWP is point to point: this controller already has a target. Use a second controller for a second SWP interface.");
             }
-            base.Unregister(peripheral);
+            target = peripheral;
+            peripheral.DataAvailable += HandleTargetData;
         }
 
-        public override void Reset()
+        public void Unregister(ISWPPeripheral peripheral)
+        {
+            if(!ReferenceEquals(target, peripheral))
+            {
+                return;
+            }
+            peripheral.DataAvailable -= HandleTargetData;
+            target = null;
+        }
+
+        public IEnumerable<NullRegistrationPoint> GetRegistrationPoints(ISWPPeripheral peripheral)
+        {
+            return ReferenceEquals(target, peripheral)
+                ? new[] { NullRegistrationPoint.Instance }
+                : Enumerable.Empty<NullRegistrationPoint>();
+        }
+
+        public IEnumerable<IRegistered<ISWPPeripheral, NullRegistrationPoint>> Children
+        {
+            get
+            {
+                return target == null
+                    ? Enumerable.Empty<IRegistered<ISWPPeripheral, NullRegistrationPoint>>()
+                    : new[] { Registered.Create(target, NullRegistrationPoint.Instance) };
+            }
+        }
+
+        // The target on the other end of the wire, or null if none is registered.
+        public ISWPPeripheral Target => target;
+
+        public void Reset()
         {
             IRQ.Unset();
-            LastReceivedLine = -1;
             lastReceived = Empty;
             BytesSent = 0;
             BytesReceived = 0;
@@ -80,103 +110,83 @@ namespace Antmicro.Renode.Peripherals.SWP
         // Power (physical layer - the CLF owns it)
         // --------------------------------------------------------------------------------------
 
-        // Drives S1 on the given line. This is power only: no bytes are exchanged, and no
-        // activation sequence is run - if the stack under test performs one, it is simply the first
-        // traffic to cross the wire afterwards.
-        public void PowerUp(int line)
+        // Drives S1. This is power only: no bytes are exchanged and no activation sequence is run -
+        // if the stack under test performs one, it is simply the first traffic to cross the wire.
+        public void PowerUp()
         {
-            SetPower(line, true);
+            SetPower(true);
         }
 
         // Drives S1 low. The target drops whatever per-session state it holds.
-        public void PowerDown(int line)
+        public void PowerDown()
         {
-            SetPower(line, false);
+            SetPower(false);
         }
 
-        public void SetPower(int line, bool powered)
+        public void SetPower(bool powered)
         {
-            if(!TryGetTarget(line, out var target))
+            if(!TryGetTarget(out var swpTarget))
             {
                 return;
             }
-            target.SetPower(powered);
-            this.Log(LogLevel.Info, "SWP line {0} {1}", line, powered ? "powered" : "unpowered");
+            swpTarget.SetPower(powered);
+            this.Log(LogLevel.Info, "SWP line {0}", powered ? "powered" : "unpowered");
         }
 
-        // Powers every registered line. Convenience for the monitor.
-        public void PowerUpAll()
-        {
-            foreach(var line in ChildCollection.Keys.OrderBy(x => x).ToArray())
-            {
-                PowerUp(line);
-            }
-        }
-
-        public bool IsPowered(int line)
-        {
-            return TryGetByAddress(line, out var target) && target.Powered;
-        }
-
-        // Power state of SWP line 0 - the common single-UICC case, readable from the monitor.
-        public bool Powered => IsPowered(0);
+        public bool Powered => target != null && target.Powered;
 
         // --------------------------------------------------------------------------------------
         // Data transfer
         // --------------------------------------------------------------------------------------
 
-        // One full-duplex slot on the given line: drives `data` on S1 and returns whatever the
-        // target drove on S2 in the same slot. The bytes are opaque - no framing is added or
-        // removed. Either direction may be empty.
-        public byte[] Transfer(int line, byte[] data)
+        // One full-duplex slot: drives `data` on S1 and returns whatever the target drove on S2 in
+        // the same slot. The bytes are opaque - no framing is added or removed. Either direction may
+        // be empty.
+        public byte[] Transfer(byte[] data)
         {
             data = data ?? Empty;
-            if(!TryGetTarget(line, out var target))
+            if(!TryGetTarget(out var swpTarget))
             {
                 return Empty;
             }
-            if(!target.Powered)
+            if(!swpTarget.Powered)
             {
-                this.Log(LogLevel.Warning, "SWP line {0} is not powered - call PowerUp first", line);
+                this.Log(LogLevel.Warning, "The SWP line is not powered - call PowerUp first");
                 return Empty;
             }
 
             BytesSent += data.Length;
-            this.Log(LogLevel.Noisy, "SWP line {0}: driving {1} byte(s) on S1", line, data.Length);
-            var answer = target.Transfer(data) ?? Empty;
+            this.Log(LogLevel.Noisy, "Driving {0} byte(s) on S1", data.Length);
+            var answer = swpTarget.Transfer(data) ?? Empty;
             if(answer.Length > 0)
             {
                 BytesReceived += answer.Length;
                 lastReceived = answer;
-                LastReceivedLine = line;
             }
             return answer;
         }
 
         // Monitor-friendly helper: transfer hex-encoded bytes, get the hex-encoded answer back.
-        public string TransferHex(int line, string hexData)
+        public string TransferHex(string hexData)
         {
-            return Misc.PrettyPrintCollectionHex(Transfer(line, Misc.HexStringToByteArray(hexData)));
+            return Misc.PrettyPrintCollectionHex(Transfer(Misc.HexStringToByteArray(hexData)));
         }
 
         // Gives the target a slot to drive S2 without the CLF sending anything. SWP is full duplex,
         // so an empty S1 slot is a legitimate way to let the far end talk.
-        public byte[] Receive(int line)
+        public byte[] Receive()
         {
-            return Transfer(line, Empty);
+            return Transfer(Empty);
         }
 
-        public string ReceiveHex(int line)
+        public string ReceiveHex()
         {
-            return Misc.PrettyPrintCollectionHex(Receive(line));
+            return Misc.PrettyPrintCollectionHex(Receive());
         }
 
         // --------------------------------------------------------------------------------------
         // Observable state
         // --------------------------------------------------------------------------------------
-
-        // SWP line the most recent bytes came from, or -1 if none since reset.
-        public int LastReceivedLine { get; private set; } = -1;
 
         // The most recent bytes received, hex-encoded (monitor-readable).
         public string LastReceivedHex => Misc.PrettyPrintCollectionHex(lastReceived);
@@ -190,45 +200,35 @@ namespace Antmicro.Renode.Peripherals.SWP
             IRQ.Unset();
         }
 
-        // Returns the target registered on the given SWP line, or null if there is none.
-        public ISWPPeripheral GetTarget(int line)
+        private bool TryGetTarget(out ISWPPeripheral swpTarget)
         {
-            return TryGetByAddress(line, out var target) ? target : null;
-        }
-
-        protected bool TryGetTarget(int line, out ISWPPeripheral target)
-        {
-            if(!TryGetByAddress(line, out target))
+            swpTarget = target;
+            if(swpTarget == null)
             {
-                this.Log(LogLevel.Warning, "No SWP target registered on line {0}", line);
+                this.Log(LogLevel.Warning, "No SWP target registered on this controller");
                 return false;
             }
             return true;
         }
 
-        // A target drove bytes on S2 on its own initiative. Record them and raise the IRQ line so
+        // The target drove bytes on S2 on its own initiative. Record them and raise the IRQ line so
         // firmware or a test can react.
-        private void HandleTargetData(ISWPPeripheral target, byte[] data)
+        private void HandleTargetData(ISWPPeripheral source, byte[] data)
         {
             if(data == null || data.Length == 0)
             {
                 return;
             }
-            var line = ChildCollection.Where(x => ReferenceEquals(x.Value, target))
-                .Select(x => (int?)x.Key).FirstOrDefault() ?? -1;
-
             BytesReceived += data.Length;
             lastReceived = data;
-            LastReceivedLine = line;
-            this.Log(LogLevel.Info, "Unsolicited {0} byte(s) from the target on SWP line {1}", data.Length, line);
+            this.Log(LogLevel.Info, "Unsolicited {0} byte(s) from the target", data.Length);
             IRQ.Set();
         }
 
+        private ISWPPeripheral target;
         private byte[] lastReceived = new byte[0];
 
-        // Field initializer, not a constructor-body assignment: Register may run before Reset.
-        private readonly Dictionary<ISWPPeripheral, Action<ISWPPeripheral, byte[]>> dataHandlers =
-            new Dictionary<ISWPPeripheral, Action<ISWPPeripheral, byte[]>>();
+        private readonly IMachine machine;
 
         private static readonly byte[] Empty = new byte[0];
     }

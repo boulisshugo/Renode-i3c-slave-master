@@ -18,6 +18,11 @@ namespace Antmicro.Renode.Exceptions
     {
         public RecoverableException(string message) : base(message) { }
     }
+
+    public class RegistrationException : Exception
+    {
+        public RegistrationException(string message) : base(message) { }
+    }
 }
 
 namespace Antmicro.Renode.Core
@@ -70,10 +75,68 @@ namespace Antmicro.Renode.Core.Structure
     using Antmicro.Renode.Core;
     using Antmicro.Renode.Peripherals;
 
-    public class NumberRegistrationPoint<T>
+    public interface IRegistrationPoint { }
+
+    public class NumberRegistrationPoint<T> : IRegistrationPoint
     {
         public NumberRegistrationPoint(T address) { Address = address; }
         public T Address { get; private set; }
+    }
+
+    public sealed class NullRegistrationPoint : IRegistrationPoint
+    {
+        public static readonly NullRegistrationPoint Instance = new NullRegistrationPoint();
+        private NullRegistrationPoint() { }
+    }
+
+    public interface IRegistered<out TPeripheral, out TRegistrationPoint>
+        where TPeripheral : IPeripheral
+        where TRegistrationPoint : IRegistrationPoint
+    {
+        TPeripheral Peripheral { get; }
+        TRegistrationPoint RegistrationPoint { get; }
+    }
+
+    public class Registered<TPeripheral, TRegistrationPoint> : IRegistered<TPeripheral, TRegistrationPoint>
+        where TPeripheral : IPeripheral
+        where TRegistrationPoint : IRegistrationPoint
+    {
+        public Registered(TPeripheral peripheral, TRegistrationPoint registrationPoint)
+        {
+            Peripheral = peripheral;
+            RegistrationPoint = registrationPoint;
+        }
+
+        public TPeripheral Peripheral { get; }
+        public TRegistrationPoint RegistrationPoint { get; }
+    }
+
+    public static class Registered
+    {
+        public static Registered<TPeripheral, TRegistrationPoint> Create<TPeripheral, TRegistrationPoint>(
+            TPeripheral peripheral, TRegistrationPoint registrationPoint)
+            where TPeripheral : IPeripheral
+            where TRegistrationPoint : IRegistrationPoint
+        {
+            return new Registered<TPeripheral, TRegistrationPoint>(peripheral, registrationPoint);
+        }
+    }
+
+    public interface IPeripheralRegister<TPeripheral, TRegistrationPoint>
+        where TPeripheral : IPeripheral
+        where TRegistrationPoint : IRegistrationPoint
+    {
+        void Register(TPeripheral peripheral, TRegistrationPoint registrationPoint);
+        void Unregister(TPeripheral peripheral);
+    }
+
+    public interface IPeripheralContainer<TPeripheral, TRegistrationPoint>
+        : IPeripheralRegister<TPeripheral, TRegistrationPoint>
+        where TPeripheral : IPeripheral
+        where TRegistrationPoint : IRegistrationPoint
+    {
+        IEnumerable<TRegistrationPoint> GetRegistrationPoints(TPeripheral peripheral);
+        IEnumerable<IRegistered<TPeripheral, TRegistrationPoint>> Children { get; }
     }
 
     public abstract class SimpleContainer<T> : IPeripheral where T : class, IPeripheral

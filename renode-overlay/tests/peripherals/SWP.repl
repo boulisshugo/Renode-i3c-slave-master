@@ -1,8 +1,10 @@
-// A CLF (SWP master) with a UICC on SWP line 0 and a second SWP line for an embedded SE.
-// SWP itself is point to point; the registration index is the CLF's SWP line number.
+// SWP is point to point: one CLF, one wire, one target. A second SWP interface is a second
+// controller with its own target - there is no line index, because there is nothing to address.
 // The CLF has no register map, so it takes no sysbus address; it is still sysbus.swp to the monitor.
+
 swp: SWP.SimpleSWPController @ sysbus
+uicc: Mocks.DummySWPTarget @ swp
 
-uicc: Mocks.DummySWPTarget @ swp 0
-
-ese: Mocks.DummySWPTarget @ swp 1
+// A second, independent SWP interface - e.g. the CLF's link to an embedded SE.
+swp2: SWP.SimpleSWPController @ sysbus
+ese: Mocks.DummySWPTarget @ swp2

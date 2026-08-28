@@ -2,7 +2,7 @@
 // Copy-paste starting point for a proprietary SWP (ETSI TS 102 613) target.
 //
 // Drop it in renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/ and refer to
-// it from a .repl as `SWP.MyProprietarySWPSlave @ swp 0`.
+// it from a .repl as `SWP.MyProprietarySWPSlave @ swp` - no line index, SWP is point to point.
 //
 // Remember what the model is: a TRANSPORT. The bytes handed to OnTransfer are exactly what the peer
 // drove on the wire - no framing, CRC or protocol byte has been removed - and whatever you return is

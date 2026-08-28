@@ -14,11 +14,11 @@ Create Machine
     Execute Command             using sysbus
     Execute Command             mach create
     Execute Command             machine LoadPlatformDescription @tests/peripherals/SWP-consistency.repl
-    Execute Command             swp PowerUp 0
+    Execute Command             swp PowerUp
 
 Create Machine With Bridge
     Create Machine
-    Execute Command             emulation CreateSWPTCPBridge sysbus.swp 0 ${BRIDGE_PORT}
+    Execute Command             emulation CreateSWPTCPBridge sysbus.swp ${BRIDGE_PORT}
     # The bridge marshals every transfer into the time domain, so the emulation must be running.
     Start Emulation
 
@@ -30,21 +30,21 @@ Should Preserve A Block Across One Transfer
     Create Machine
 
     ${data}=                    Random Hex  64
-    ${pretty}=                  Execute Command  swp TransferHex 0 "${data}"
+    ${pretty}=                  Execute Command  swp TransferHex "${data}"
     ${got}=                     Normalize Pretty Hex  ${pretty}
     Should Be Equal             ${got}  ${data}
 
 Should Preserve Bytes That Would Need Escaping In A Framed Link
     Create Machine
 
-    ${pretty}=                  Execute Command  swp TransferHex 0 "7E7F7E7FFFFFFFFF00FF7E7F"
+    ${pretty}=                  Execute Command  swp TransferHex "7E7F7E7FFFFFFFFF00FF7E7F"
     ${got}=                     Normalize Pretty Hex  ${pretty}
     Should Be Equal             ${got}  7e7f7e7fffffffff00ff7e7f
 
 Should Preserve An All Ones Block
     Create Machine
 
-    ${pretty}=                  Execute Command  swp TransferHex 0 "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+    ${pretty}=                  Execute Command  swp TransferHex "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
     ${got}=                     Normalize Pretty Hex  ${pretty}
     Should Be Equal             ${got}  ffffffffffffffffffffffffffffffff
 
@@ -52,7 +52,7 @@ Should Preserve A Large Block
     Create Machine
 
     ${data}=                    Random Hex  4096
-    ${pretty}=                  Execute Command  swp TransferHex 0 "${data}"
+    ${pretty}=                  Execute Command  swp TransferHex "${data}"
     ${got}=                     Normalize Pretty Hex  ${pretty}
     Should Be Equal             ${got}  ${data}
 

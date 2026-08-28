@@ -2,6 +2,6 @@
 // transport can be checked byte-for-byte. The transport adds no framing, so bytes that a framed
 // link would have to escape must survive unchanged too.
 // The CLF has no register map, so it takes no sysbus address; it is still sysbus.swp to the monitor.
-swp: SWP.SimpleSWPController @ sysbus
 
-uicc: Mocks.EchoSWPDevice @ swp 0
+swp: SWP.SimpleSWPController @ sysbus
+uicc: Mocks.EchoSWPDevice @ swp

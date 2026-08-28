@@ -13,7 +13,7 @@ This repo provides agnostic SWP models
 `ISWPPeripheral` contract (`Powered` / `SetPower` / `Transfer` / `DataAvailable`):
 
 - `SimpleSWPPeripheral` — the base you subclass for a proprietary target.
-- `SimpleSWPController` — the CLF (master), a `SimpleContainer<ISWPPeripheral>` keyed by SWP line.
+- `SimpleSWPController` — the CLF (master). Holds exactly one target: SWP is point to point.
 - `SWPTCPBridge` — bridges a target to a raw TCP socket.
 - Mocks: `DummySWPTarget` (records bytes, drives S2 unprompted) and `EchoSWPDevice` (loopback).
 
@@ -39,8 +39,9 @@ port it, or check against it. It is not compiled into Renode.
 ## Key SWP facts (vs I3C and SPI)
 
 - **Point to point, full duplex, one wire.** The CLF drives S1 (voltage domain), the target answers on
-  S2 (current domain), both at once. No bus address, no chip select — the registration index is the
-  CLF's **SWP line number** (a CLF often has one line to the UICC and one to an embedded SE).
+  S2 (current domain), both at once. No bus address, no chip select, and **no line index** — one
+  controller holds one target, and its API takes no line argument. A CLF with two SWP interfaces is
+  two controllers.
 - **The CLF owns power.** Only the master can power the interface up or down. Nothing crosses an
   unpowered line.
 - **The target can talk unprompted.** `SendData(bytes)` drives S2 without being polled — the SWP
@@ -88,8 +89,11 @@ private readonly object locker = new object();
 ```repl
 swp:  SWP.SimpleSWPController @ sysbus
 
-uicc: SWP.MyProprietarySWPSlave @ swp 0
+uicc: SWP.MyProprietarySWPSlave @ swp
 ```
+
+Note `@ swp` with no index — there is no line to number, and registering a second target on the same
+controller is refused. A second SWP interface is a second controller with its own target.
 
 **The controller takes no address.** The CLF is a separate chip on the far end of the SWP line, not a
 block inside the SoC: it has no register map, so it is not `IDoubleWordPeripheral` and not
@@ -103,7 +107,7 @@ the same as the I3C and SPI models:
 ```repl
 uicc: SWP.MyFirmwareManagedUicc @ {
         sysbus 0x90000000;
-        swp 0
+        swp
     }
 ```
 
@@ -114,16 +118,15 @@ Load it: `machine LoadPlatformDescription @tests/peripherals/<name>.repl`.
 ## Step 3 — Drive the master (monitor / robot / C#)
 
 ```
-swp PowerUp 0                          # drives S1. No handshake, no bytes.
+swp PowerUp                          # drives S1. No handshake, no bytes.
 swp Powered                            # -> True
-swp IsPowered 0                        # per-line
-swp TransferHex 0 "00A40004"           # one full-duplex slot -> hex of what came back on S2
-swp ReceiveHex 0                       # empty S1 slot, letting the target talk
-swp PowerDown 0                        # S1 low; the target drops its session state
+swp IsPowered                        # per-line
+swp TransferHex "00A40004"           # one full-duplex slot -> hex of what came back on S2
+swp ReceiveHex                       # empty S1 slot, letting the target talk
+swp PowerDown                        # S1 low; the target drops its session state
 swp IRQ IsSet                          # unsolicited data from a target drives this GPIO
 swp AcknowledgeInterrupt
 swp LastReceivedHex                    # bytes of the most recent block in
-swp LastReceivedLine                   # which line they came from
 swp BytesSent / swp BytesReceived
 swp.uicc EnqueueResponseHex "0102"     # queue what the target drives on S2 next slot
 swp.uicc SendDataHex "AABB"            # DummySWPTarget: drive S2 unprompted
@@ -152,15 +155,14 @@ out  6F1A
   with *"Parameters did not match the signature"*.
 - **`byte[]` params are not monitor-friendly.** Expose `…Hex(...)` helpers; keep `byte[]` for C#.
 - **Avoid overloads differing only by an added `string`** (the monitor binds the longer one with `null`).
-- **A negative `int` prints as `0xFFFFFFFF`** — don't assert `== -1` on `LastReceivedLine`.
 
 ---
 
 ## Step 4 — Connect an external client via the TCP bridge
 
 ```
-emulation CreateSWPTCPBridge sysbus.swp 0 3456          # synchronous
-emulation CreateSWPTCPBridge sysbus.swp 0 3456 true     # forward-on-unsolicited-data
+emulation CreateSWPTCPBridge sysbus.swp 3456          # synchronous
+emulation CreateSWPTCPBridge sysbus.swp 3456 true     # forward-on-unsolicited-data
 ```
 
 **Transparent in both directions.** The client sends raw bytes and receives raw bytes; nothing is added
@@ -208,8 +210,8 @@ maintenance cost.
    protocol there; field-initialize anything `Reset()` touches.
 2. Reset your stack in `OnPowerChanged(false)`.
 3. Don't assume block boundaries are frame boundaries — buffer and re-frame.
-4. `.repl`: `SWP.<YourClass> @ swp <line>` (or `@ { sysbus 0x..; swp <line> }`), with
+4. `.repl`: `SWP.<YourClass> @ swp` (or `@ { sysbus 0x..; swp }`), with
    `SWP.SimpleSWPController @ sysbus` (no address — the controller has no register map).
-5. `swp PowerUp <line>` **before** `TransferHex`.
+5. `swp PowerUp` **before** `TransferHex`.
 6. Debug with `swp.<name> TraceHex`.
 7. Bridge: `CreateSWPTCPBridge`, power the line, then `start`.

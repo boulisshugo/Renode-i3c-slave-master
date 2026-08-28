@@ -1,13 +1,14 @@
 // Minimal SWP platform: a CLF master with one proprietary target on SWP line 0.
 //
-//   (machine) swp PowerUp 0          // drives S1 - no handshake, no bytes
-//   (machine) swp TransferHex 0 "0102"
+//   (machine) swp PowerUp            // drives S1 - no handshake, no bytes
+//   (machine) swp TransferHex "0102"
 
 // No address: the CLF is a separate chip with no register map, so it registers on the sysbus
 // without claiming any address space. The monitor still reaches it as sysbus.swp.
 swp: SWP.SimpleSWPController @ sysbus
 
-uicc: SWP.MyProprietarySWPSlave @ swp 0
+// SWP is point to point - no line index. A second interface is a second controller.
+uicc: SWP.MyProprietarySWPSlave @ swp
 
 // ---------------------------------------------------------------------------------------------
 // Firmware-managed variant: the target is registered on BOTH the sysbus (memory-mapped registers
@@ -29,5 +30,5 @@ uicc: SWP.MyProprietarySWPSlave @ swp 0
 //
 // uicc: SWP.MyFirmwareManagedUicc @ {
 //         sysbus 0x90000000;
-//         swp 0
+//         swp
 //     }

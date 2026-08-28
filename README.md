@@ -310,7 +310,7 @@ check against.
 |------|------|
 | `ISWPPeripheral.cs` | The target contract: `Powered`, `SetPower`, `Transfer`, `DataAvailable`. |
 | `SimpleSWPPeripheral.cs` | Agnostic target — transport endpoint with an `OnTransfer` hook and a raw byte trace. **Subclass this.** |
-| `SimpleSWPController.cs` | Agnostic CLF; a `SimpleContainer<ISWPPeripheral>` keyed by SWP line that owns power and carries bytes. |
+| `SimpleSWPController.cs` | Agnostic CLF; holds exactly one target (SWP is point to point), owns power, carries bytes. |
 | `SWPTCPBridge.cs` | Transparent TCP bridge: raw bytes in, raw bytes out. |
 | `Mocks/DummySWPTarget.cs` | Ready-to-use mock target (records bytes, drives S2 unprompted). |
 | `Mocks/EchoSWPDevice.cs` | Mock target that echoes each block (for integrity testing). |
@@ -337,16 +337,20 @@ Two consequences worth knowing:
 
 ### Wiring in a platform (`.repl`)
 
-SWP is point to point, but a CLF usually has more than one SWP line (one to the UICC, one to an
-embedded SE), so targets register by **SWP line number**:
+SWP is point to point: one CLF, one wire, one target. There is no addressing on the wire and nothing
+to select, so the controller holds exactly one target and its API takes no line argument. A CLF with
+two SWP interfaces is **two controllers**, which is what the hardware is:
 
 ```repl
 swp: SWP.SimpleSWPController @ sysbus
+uicc: Mocks.DummySWPTarget @ swp
 
-uicc: Mocks.DummySWPTarget @ swp 0
-
-ese: Mocks.DummySWPTarget @ swp 1
+// a second, independent interface - e.g. the link to an embedded SE
+swp2: SWP.SimpleSWPController @ sysbus
+ese: Mocks.DummySWPTarget @ swp2
 ```
+
+Note the target registers with `@ swp` and no index — there is no line to number.
 
 As with the I3C and SPI controllers, the CLF takes **no sysbus address** — it is a separate chip with no
 register map, so claiming address space would misrepresent what is memory-mapped.
@@ -354,24 +358,24 @@ register map, so claiming address space would misrepresent what is memory-mapped
 ### Driving it from the monitor
 
 ```
-(machine) swp PowerUp 0                        # drives S1. No handshake, no bytes.
+(machine) swp PowerUp                        # drives S1. No handshake, no bytes.
 (machine) swp Powered                          # -> True
 (machine) swp.uicc EnqueueResponseHex "0102A0"
-(machine) swp TransferHex 0 "DEADBEEF"         # one full-duplex slot -> [0x1, 0x2, 0xA0]
-(machine) swp ReceiveHex 0                     # empty S1 slot, letting the target talk
+(machine) swp TransferHex "DEADBEEF"         # one full-duplex slot -> [0x1, 0x2, 0xA0]
+(machine) swp ReceiveHex                     # empty S1 slot, letting the target talk
 (machine) swp.uicc SendDataHex "AB"            # the target drives S2 unprompted
 (machine) swp IRQ IsSet                        # -> True
 (machine) swp LastReceivedHex                  # -> [0xAB]
 (machine) swp.uicc TraceHex                    # raw bytes both ways
-(machine) swp PowerDown 0
+(machine) swp PowerDown
 ```
 
 ### TCP bridge
 
 ```
-(machine) swp PowerUp 0
-(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456        # synchronous
-(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456 true   # forward-on-unsolicited-data
+(machine) swp PowerUp
+(machine) emulation CreateSWPTCPBridge sysbus.swp 3456        # synchronous
+(machine) emulation CreateSWPTCPBridge sysbus.swp 3456 true   # forward-on-unsolicited-data
 (machine) start
 ```
 

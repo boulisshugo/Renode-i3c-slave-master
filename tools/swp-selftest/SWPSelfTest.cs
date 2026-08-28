@@ -44,23 +44,39 @@ public static class SWPSelfTest
         Check("a line starts unpowered", !clf.Powered && !uicc.Powered);
         Logger.Entries.Clear();
         Check("a transfer on an unpowered line carries nothing",
-            clf.Transfer(0, Hex("DEAD")).Length == 0 && uicc.ReceivedCount == 0);
+            clf.Transfer(Hex("DEAD")).Length == 0 && uicc.ReceivedCount == 0);
         Check("  and it says why", Logged("is not powered"));
 
-        clf.PowerUp(0);
+        clf.PowerUp();
         Check("PowerUp powers both sides", clf.Powered && uicc.Powered);
         Check("  and exchanges no bytes doing it - there is no activation sequence",
             clf.BytesSent == 0 && clf.BytesReceived == 0 && uicc.BytesReceived == 0 && uicc.BytesSent == 0);
 
-        clf.Transfer(0, Hex("01"));
-        clf.PowerDown(0);
+        clf.Transfer(Hex("01"));
+        clf.PowerDown();
         Check("PowerDown unpowers both sides", !clf.Powered && !uicc.Powered);
         Check("  and the target drops its per-session state", uicc.LastReceivedHex == "[]");
         Check("re-powering works", Reapply(clf, uicc));
 
+        var second = new SimpleSWPController(null);
+        second.Register(new DummySWPTarget(), NullRegistrationPoint.Instance);
+        var refused = false;
+        try
+        {
+            second.Register(new DummySWPTarget(), NullRegistrationPoint.Instance);
+        }
+        catch(Antmicro.Renode.Exceptions.RegistrationException)
+        {
+            refused = true;
+        }
+        Check("SWP is point to point: a second target is refused", refused);
+        Check("  and the first target is still the one on the wire", second.Target != null);
+
         Logger.Entries.Clear();
-        Check("a missing line is refused", clf.Transfer(7, Hex("AA")).Length == 0);
-        Check("  and it says why", Logged("No SWP target registered on line 7"));
+        var orphan = new SimpleSWPController(null);
+        Check("a controller with no target carries nothing", orphan.Transfer(Hex("AA")).Length == 0);
+        Check("  and it says why", Logged("No SWP target registered on this controller"));
+        Check("  and reports no target", orphan.Target == null && !orphan.Powered);
     }
 
     // ----------------------------------------------------------------------------------------
@@ -70,36 +86,36 @@ public static class SWPSelfTest
 
         var uicc = new DummySWPTarget();
         var clf = Build(uicc);
-        clf.PowerUp(0);
+        clf.PowerUp();
 
         Check("bytes driven on S1 reach the target",
-            clf.Transfer(0, Hex("DEADBEEF")).Length == 0 && uicc.LastReceivedHex == "[0xDE, 0xAD, 0xBE, 0xEF]");
+            clf.Transfer(Hex("DEADBEEF")).Length == 0 && uicc.LastReceivedHex == "[0xDE, 0xAD, 0xBE, 0xEF]");
 
         uicc.EnqueueResponseHex("010203");
         Check("bytes the target drives on S2 come back in the same slot",
-            clf.TransferHex(0, "AA") == "[0x1, 0x2, 0x3]");
+            clf.TransferHex("AA") == "[0x1, 0x2, 0x3]");
 
         uicc.EnqueueResponseHex("77");
         Check("an empty S1 slot still lets the target talk (Receive)",
-            clf.ReceiveHex(0) == "[0x77]");
+            clf.ReceiveHex() == "[0x77]");
 
         Check("byte counters add up",
             clf.BytesSent == 4 + 1 + 0 && clf.BytesReceived == 3 + 1);
 
         var echo = new EchoSWPDevice();
         var clfEcho = Build(echo);
-        clfEcho.PowerUp(0);
+        clfEcho.PowerUp();
         var all = true;
         for(var i = 0; i < 200; i++)
         {
             var payload = RandomBytes(1 + (i % 64));
-            all &= clfEcho.Transfer(0, payload).SequenceEqual(payload);
+            all &= clfEcho.Transfer(payload).SequenceEqual(payload);
         }
         Check("200 echo round trips carry every byte intact", all);
 
         var big = RandomBytes(4096);
         Check("a 4096-byte block is carried whole, with no size limit imposed",
-            clfEcho.Transfer(0, big).SequenceEqual(big));
+            clfEcho.Transfer(big).SequenceEqual(big));
     }
 
     // ----------------------------------------------------------------------------------------
@@ -109,17 +125,16 @@ public static class SWPSelfTest
 
         var uicc = new DummySWPTarget();
         var clf = Build(uicc);
-        clf.PowerUp(0);
+        clf.PowerUp();
 
         Check("IRQ is clear to start", !clf.IRQ.IsSet);
         uicc.SendDataHex("112233");
         Check("unsolicited data raises IRQ", clf.IRQ.IsSet);
-        Check("  carrying the bytes and the line",
-            clf.LastReceivedHex == "[0x11, 0x22, 0x33]" && clf.LastReceivedLine == 0);
+        Check("  carrying the bytes", clf.LastReceivedHex == "[0x11, 0x22, 0x33]");
         clf.AcknowledgeInterrupt();
         Check("the interrupt can be acknowledged", !clf.IRQ.IsSet);
 
-        clf.PowerDown(0);
+        clf.PowerDown();
         Logger.Entries.Clear();
         uicc.SendDataHex("44");
         Check("an unpowered target cannot drive S2", !clf.IRQ.IsSet && Logged("not powered"));
@@ -132,9 +147,9 @@ public static class SWPSelfTest
 
         var uicc = new DummySWPTarget();
         var clf = Build(uicc);
-        clf.PowerUp(0);
+        clf.PowerUp();
         uicc.EnqueueResponseHex("BB");
-        clf.Transfer(0, Hex("AA"));
+        clf.Transfer(Hex("AA"));
         uicc.SendDataHex("CC");
 
         var lines = uicc.TraceHex.Split('\n');
@@ -150,17 +165,17 @@ public static class SWPSelfTest
 
         var quiet = new DummySWPTarget { TraceDepth = 0 };
         var clfQuiet = Build(quiet);
-        clfQuiet.PowerUp(0);
-        clfQuiet.Transfer(0, Hex("01"));
+        clfQuiet.PowerUp();
+        clfQuiet.Transfer(Hex("01"));
         Check("TraceDepth 0 disables recording", quiet.TraceHex == "(nothing traced)");
         Check("  but the last block stays observable", quiet.LastReceivedHex == "[0x1]");
 
         var capped = new DummySWPTarget { TraceDepth = 2 };
         var clfCapped = Build(capped);
-        clfCapped.PowerUp(0);
-        clfCapped.Transfer(0, Hex("01"));
-        clfCapped.Transfer(0, Hex("02"));
-        clfCapped.Transfer(0, Hex("03"));
+        clfCapped.PowerUp();
+        clfCapped.Transfer(Hex("01"));
+        clfCapped.Transfer(Hex("02"));
+        clfCapped.Transfer(Hex("03"));
         Check("the trace is bounded by TraceDepth", capped.TraceHex.Split('\n').Length == 2);
     }
 
@@ -171,35 +186,35 @@ public static class SWPSelfTest
 
         var echo = new EchoSWPDevice();
         var clf = Build(echo);
-        clf.PowerUp(0);
+        clf.PowerUp();
 
         // Bytes that a framing layer would have to escape or stuff must pass through untouched,
         // because this transport does no framing at all.
         foreach(var awkward in new[] { "7E", "7F", "7E7F7E7F", "FFFFFFFFFFFFFFFF", "00", "0000000000" })
         {
             var payload = Hex(awkward);
-            Check("carries " + awkward + " unchanged", clf.Transfer(0, payload).SequenceEqual(payload));
+            Check("carries " + awkward + " unchanged", clf.Transfer(payload).SequenceEqual(payload));
         }
 
         var every = Enumerable.Range(0, 256).Select(x => (byte)x).ToArray();
-        Check("carries all 256 byte values unchanged", clf.Transfer(0, every).SequenceEqual(every));
+        Check("carries all 256 byte values unchanged", clf.Transfer(every).SequenceEqual(every));
 
-        var target = clf.GetTarget(0);
+        var target = clf.Target;
         Check("an empty transfer is legal and carries nothing", target.Transfer(new byte[0]).Length == 0);
     }
 
     // ----------------------------------------------------------------------------------------
     private static bool Reapply(SimpleSWPController clf, DummySWPTarget uicc)
     {
-        clf.PowerUp(0);
+        clf.PowerUp();
         uicc.EnqueueResponseHex("42");
-        return clf.TransferHex(0, "11") == "[0x42]";
+        return clf.TransferHex("11") == "[0x42]";
     }
 
     private static SimpleSWPController Build(ISWPPeripheral target)
     {
         var controller = new SimpleSWPController(null);
-        controller.Register(target, new NumberRegistrationPoint<int>(0));
+        controller.Register(target, NullRegistrationPoint.Instance);
         return controller;
     }
 

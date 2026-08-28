@@ -20,8 +20,8 @@ namespace Antmicro.Renode.Peripherals.SWP
         // Creates a raw TCP bridge to a UICC on a SimpleSWPController.
         //
         // Monitor usage:
-        //   emulation CreateSWPTCPBridge sysbus.swp 0 3456          # synchronous mode (default)
-        //   emulation CreateSWPTCPBridge sysbus.swp 0 3456 true     # forward-on-unsolicited-data mode
+        //   emulation CreateSWPTCPBridge sysbus.swp 3456          # synchronous mode (default)
+        //   emulation CreateSWPTCPBridge sysbus.swp 3456 true     # forward-on-unsolicited-data mode
         //
         // The client speaks RAW bytes in both directions and the bridge is transparent: whatever it
         // sends is driven on S1 unchanged, and whatever the target drives on S2 is streamed back
@@ -42,14 +42,14 @@ namespace Antmicro.Renode.Peripherals.SWP
         // it, so a run is reproducible regardless of host socket timing - which is also why the
         // emulation must be running (`start`) and the line powered for a bridge transfer to execute.
         public static void CreateSWPTCPBridge(this Emulation emulation, SimpleSWPController controller,
-            int line, int port, bool forwardOnUnsolicitedData = false, string name = "swpBridge")
+            int port, bool forwardOnUnsolicitedData = false, string name = "swpBridge")
         {
             if(port < 0 || port > 65535)
             {
                 throw new RecoverableException("Port must be between 0 and 65535");
             }
             emulation.ExternalsManager.AddExternal(
-                new SWPTCPBridge(controller, line, port, forwardOnUnsolicitedData), name);
+                new SWPTCPBridge(controller, port, forwardOnUnsolicitedData), name);
         }
     }
 
@@ -58,11 +58,10 @@ namespace Antmicro.Renode.Peripherals.SWP
     [Transient]
     public class SWPTCPBridge : IExternal, IDisposable
     {
-        public SWPTCPBridge(SimpleSWPController controller, int line, int port,
+        public SWPTCPBridge(SimpleSWPController controller, int port,
             bool forwardOnUnsolicitedData = false)
         {
             this.controller = controller;
-            this.line = line;
             this.forwardOnUnsolicitedData = forwardOnUnsolicitedData;
             // The machine that owns the controller - used to run every exchange inside its time domain.
             machine = controller.GetMachine();
@@ -70,26 +69,26 @@ namespace Antmicro.Renode.Peripherals.SWP
             server = new SocketServerProvider(telnetMode: false, serverName: "SWPBridge");
             // Read up to a full chunk per recv so a message is delivered as one block, not byte-by-byte.
             server.BufferSize = 4096;
-            server.ConnectionAccepted += _ => this.Log(LogLevel.Info, "TCP client connected on the SWP bridge for line {0}", line);
+            server.ConnectionAccepted += _ => this.Log(LogLevel.Info, "TCP client connected on the SWP bridge");
             server.ConnectionClosed += () => this.Log(LogLevel.Info, "TCP client disconnected from the SWP bridge");
             server.DataBlockReceived += HandleDataReceived;
 
             if(forwardOnUnsolicitedData)
             {
-                target = controller.GetTarget(line);
+                target = controller.Target;
                 if(target != null)
                 {
                     target.DataAvailable += HandleTargetData;
                 }
                 else
                 {
-                    this.Log(LogLevel.Warning, "No SWP target on line {0} to subscribe for unsolicited data", line);
+                    this.Log(LogLevel.Warning, "No SWP target registered to subscribe for unsolicited data");
                 }
             }
 
             server.Start(port);
-            this.Log(LogLevel.Info, "SWP TCP bridge for line {0} listening on port {1} ({2})",
-                line, port, forwardOnUnsolicitedData ? "forward-on-unsolicited-data" : "synchronous");
+            this.Log(LogLevel.Info, "SWP TCP bridge listening on port {0} ({1})",
+                port, forwardOnUnsolicitedData ? "forward-on-unsolicited-data" : "synchronous");
         }
 
         public void Dispose()
@@ -112,8 +111,8 @@ namespace Antmicro.Renode.Peripherals.SWP
                 return;
             }
 
-            this.Log(LogLevel.Debug, "Bridge received {0} bytes from TCP for SWP line {1}: {2}",
-                data.Length, line, Misc.PrettyPrintCollectionHex(data));
+            this.Log(LogLevel.Debug, "Bridge received {0} bytes from TCP: {1}",
+                data.Length, Misc.PrettyPrintCollectionHex(data));
 
             machine.HandleTimeDomainEvent<byte[]>(DriveExchange, data, timeDomainInternalEvent: false);
         }
@@ -122,7 +121,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         // synchronous mode, streams whatever came back on S2 in the same slot straight to the client.
         private void DriveExchange(byte[] data)
         {
-            var answer = controller.Transfer(line, data);
+            var answer = controller.Transfer(data);
             if(forwardOnUnsolicitedData)
             {
                 // The answer arrives later, when the target drives S2 by itself (see
@@ -155,7 +154,6 @@ namespace Antmicro.Renode.Peripherals.SWP
         private readonly SocketServerProvider server;
         private readonly SimpleSWPController controller;
         private readonly ISWPPeripheral target;
-        private readonly int line;
         private readonly bool forwardOnUnsolicitedData;
     }
 }
