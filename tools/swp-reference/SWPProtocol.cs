@@ -10,6 +10,8 @@ namespace Antmicro.Renode.Peripherals.SWP
 {
     // The SWP Logical Link Control layers (ETSI TS 102 613 clauses 10 and 11).
     //
+    // REFERENCE IMPLEMENTATION - deliberately NOT part of the Renode peripherals. See SWPFrame.cs.
+    //
     // The control field is the first byte of an SWP frame payload. Which LLC that byte belongs to
     // follows from the interface state: the ACT LLC carries the activation sequence, and once the
     // interface is ACTIVATED the generic LLC is SHDLC. The two encodings do not overlap - SHDLC
@@ -22,6 +24,15 @@ namespace Antmicro.Renode.Peripherals.SWP
     // sequencing are per the specification, but the numeric opcodes and the ACT_INFORMATION layout
     // are this model's profile - they are gathered here so that matching real silicon is a matter of
     // changing these constants and nothing else.
+    // Power mode the CLF selects in the ACT_POWER_MODE frame (clause 11). This is an ACT-layer
+    // concept, negotiated in a frame - distinct from whether S1 is being driven at all, which is
+    // physical and is what the transport's `Powered` models.
+    public enum SWPPowerMode
+    {
+        LowPower = 0,
+        FullPower = 1,
+    }
+
     public static class SWPProtocol
     {
         // ------------------------------------------------------------------------------------------

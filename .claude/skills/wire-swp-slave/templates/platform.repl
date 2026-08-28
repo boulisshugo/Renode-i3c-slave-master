@@ -1,7 +1,7 @@
-// Minimal SWP platform: a CLF master with one proprietary UICC on SWP line 0.
+// Minimal SWP platform: a CLF master with one proprietary target on SWP line 0.
 //
-//   (machine) swp Activate 0
-//   (machine) swp SendHex 0 "0102"
+//   (machine) swp PowerUp 0          // drives S1 - no handshake, no bytes
+//   (machine) swp TransferHex 0 "0102"
 
 // No address: the CLF is a separate chip with no register map, so it registers on the sysbus
 // without claiming any address space. The monitor still reaches it as sysbus.swp.
@@ -10,9 +10,10 @@ swp: SWP.SimpleSWPController @ sysbus
 uicc: SWP.MyProprietarySWPSlave @ swp 0
 
 // ---------------------------------------------------------------------------------------------
-// Firmware-managed variant: the UICC is registered on BOTH the sysbus (memory-mapped registers the
-// CPU firmware drives) and the SWP line (so the CLF can reach it). Needs the class to implement
-// IDoubleWordPeripheral and IKnownSize as well.
+// Firmware-managed variant: the target is registered on BOTH the sysbus (memory-mapped registers
+// the CPU firmware drives) and the SWP line (so the CLF can reach it). Needs the class to implement
+// IDoubleWordPeripheral and IKnownSize as well. This is the arrangement in which the protocol most
+// naturally lives in firmware - which is where it lives on real silicon.
 // ---------------------------------------------------------------------------------------------
 //
 // mem: Memory.MappedMemory @ sysbus 0x80000000

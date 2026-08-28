@@ -1,5 +1,7 @@
-// A CLF with an echoing UICC: every I-frame payload comes straight back, so the whole
-// framing / CRC / sequencing chain can be checked byte-for-byte.
+// A CLF with an echoing target: whatever the CLF drives on S1 comes straight back on S2, so the
+// transport can be checked byte-for-byte. The transport adds no framing, so bytes that a framed
+// link would have to escape must survive unchanged too.
+// The CLF has no register map, so it takes no sysbus address; it is still sysbus.swp to the monitor.
 swp: SWP.SimpleSWPController @ sysbus
 
 uicc: Mocks.EchoSWPDevice @ swp 0

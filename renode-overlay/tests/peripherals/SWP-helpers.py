@@ -30,9 +30,9 @@ def _recv_n(sock, want, timeout):
 
 
 def transfer_over_swp_bridge(port, hex_data, expected_len=None, timeout=3.0):
-    """Connect to the SWP TCP bridge, send raw LLC payload bytes (given as a hex string), and return
-    the payload the UICC answered with. The SWP framing, CRC and SHDLC control byte are added and
-    removed inside the emulation - the client only ever sees application bytes."""
+    """Connect to the SWP TCP bridge, send raw bytes (given as a hex string), and return the bytes
+    the target drove back. The bridge and the SWP transport are transparent - nothing is added or
+    removed anywhere in the path."""
     payload = bytes.fromhex(hex_data)
     want = int(expected_len) if expected_len is not None else len(payload)
     sock = _connect(port, float(timeout))
@@ -77,13 +77,3 @@ def normalize_pretty_hex(pretty):
     parts = [p.strip() for p in inner.split(",") if p.strip()]
     return "".join("%02x" % int(p, 16) for p in parts)
 
-
-def swp_crc(hex_payload):
-    """Independent reference CRC-16 (X^16 + X^12 + X^5 + 1, init 0xFFFF, MSB first) over a
-    hex-encoded payload, used to cross-check the C# codec inside Renode."""
-    crc = 0xFFFF
-    for b in bytes.fromhex(hex_payload):
-        crc ^= b << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-    return "0x%04X" % crc

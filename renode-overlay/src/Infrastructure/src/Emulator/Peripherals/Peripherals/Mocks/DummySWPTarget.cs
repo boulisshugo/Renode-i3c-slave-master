@@ -12,11 +12,11 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.Mocks
 {
-    // A ready-to-use mock SWP (UICC) target for testing a CLF and for quick wiring from the monitor.
+    // A ready-to-use mock SWP target for testing a CLF and for quick wiring from the monitor.
     //
-    // It is a plain SimpleSWPPeripheral - so the ACT activation sequence and SHDLC come for free -
-    // plus introspection of what it received and monitor-friendly helpers to answer and to transmit
-    // on its own initiative. It is the SWP analog of DummyI3CSlave / DummySPITarget.
+    // It is a plain SimpleSWPPeripheral - a transparent transport endpoint - plus introspection of
+    // what it received and a monitor helper to drive S2 unprompted. It is the SWP analog of
+    // DummyI3CSlave / DummySPITarget.
     public class DummySWPTarget : SimpleSWPPeripheral
     {
         public override void Reset()
@@ -25,39 +25,41 @@ namespace Antmicro.Renode.Peripherals.Mocks
             received.Clear();
         }
 
-        // Monitor-friendly helper: transmit an unsolicited I-frame carrying hex-encoded data. SWP is
-        // full duplex, so the UICC does not need to be polled first - this is the SWP equivalent of
-        // an I3C In-Band Interrupt or an SPI data-ready line.
-        public void RequestServiceWithData(string hexData)
+        // Monitor-friendly helper: drive hex-encoded bytes on S2 without being polled. SWP is full
+        // duplex, so the target does not need to be addressed first.
+        public void SendDataHex(string hexData)
         {
-            SendInformation(Misc.HexStringToByteArray(hexData));
+            SendData(Misc.HexStringToByteArray(hexData));
         }
 
-        // Number of I-frame payloads received since reset.
+        // Number of non-empty blocks received since reset.
         public int ReceivedCount => received.Count;
 
-        // All I-frame payloads received since reset, concatenated and hex-encoded.
+        // Every byte received since reset, concatenated and hex-encoded.
         public string AllReceivedHex
         {
             get
             {
                 var all = new List<byte>();
-                foreach(var item in received)
+                foreach(var block in received)
                 {
-                    all.AddRange(item);
+                    all.AddRange(block);
                 }
                 return Misc.PrettyPrintCollectionHex(all.ToArray());
             }
         }
 
-        // Raised for every I-frame payload delivered to the target.
-        public event Action<byte[]> InformationReceived;
+        // Raised for every non-empty block the CLF drives on S1.
+        public event Action<byte[]> DataReceived;
 
-        protected override byte[] OnInformation(byte[] payload)
+        protected override byte[] OnTransfer(byte[] incoming)
         {
-            received.Add(payload);
-            InformationReceived?.Invoke(payload);
-            return base.OnInformation(payload);
+            if(incoming.Length > 0)
+            {
+                received.Add(incoming);
+                DataReceived?.Invoke(incoming);
+            }
+            return base.OnTransfer(incoming);
         }
 
         private readonly List<byte[]> received = new List<byte[]>();

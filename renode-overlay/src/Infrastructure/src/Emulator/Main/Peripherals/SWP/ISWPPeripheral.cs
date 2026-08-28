@@ -10,62 +10,38 @@ namespace Antmicro.Renode.Peripherals.SWP
 {
     // Single Wire Protocol (ETSI TS 102 613) target contract - the UICC side of a CLF <-> UICC link.
     //
-    // SWP is a point-to-point, full-duplex link over one wire: the CLF (master) drives S1 in the
-    // voltage domain, the UICC (slave) answers on S2 in the current domain, both at the same time.
-    // The CLF is the only side that can power the interface up or down; once the interface is up the
-    // UICC may transmit on S2 whenever it has something to say.
+    // This is a TRANSPORT, not a protocol stack. SWP is a point-to-point, full-duplex link over one
+    // wire: the CLF (master) drives S1 in the voltage domain, the UICC (slave) answers on S2 in the
+    // current domain, both at the same time, and only the CLF can power the interface up or down.
+    // Those are the properties modelled here - carrying bytes in both directions, and the power
+    // state that gates them.
     //
-    // This contract sits at the DATA LINK LAYER (clause 8): every method exchanges a complete SWP
-    // *wire frame* - SOF, bit-stuffed payload and CRC, EOF, bit-packed MSB first, exactly as
-    // SWPFrame.Encode produces it. The S1/S2 bit modulation below that is abstracted away; everything
-    // above it (framing, CRC, the ACT activation LLC and SHDLC) is real and is what the models
-    // implement. See SWPFrame and SWPProtocol for the encodings.
+    // Everything above the wire - the frame delimiting and CRC of clause 8, the ACT activation
+    // sequence of clause 11, SHDLC of clause 10 - is deliberately NOT implemented. Those layers
+    // belong to whatever is under test: a proprietary UICC model, CPU firmware, or an external
+    // client on the far end of the TCP bridge. A model that ran its own ACT/SHDLC would be talking
+    // to that stack instead of carrying it, which is exactly what a transport must not do.
+    // tools/swp-reference/ has a standalone implementation of those layers if a test-bench or client
+    // wants one.
     //
-    // Proprietary UICC models should subclass SimpleSWPPeripheral (which already implements ACT and
-    // SHDLC) rather than implementing this interface directly, then register on a SimpleSWPController.
+    // Proprietary UICC models should subclass SimpleSWPPeripheral and override OnTransfer, then
+    // register on a SimpleSWPController.
     public interface ISWPPeripheral : IPeripheral
     {
-        // Current interface state as seen by the target (clause 6 activation state machine).
-        SWPInterfaceState InterfaceState { get; }
+        // True while the CLF is driving S1. Nothing crosses the wire when it is false.
+        bool Powered { get; }
 
-        // The CLF starts driving S1: DEACTIVATED -> ACT_SYNC. The UICC signals it is ready to
-        // communicate by sending its first ACT_SYNC frame, which is returned here (an empty array
-        // means the target stayed silent - the CLF then treats the activation as failed).
-        byte[] Activate();
+        // The CLF powers the interface up or drives S1 low. Physical layer only: no bytes are
+        // exchanged here, and the target drops whatever per-session state it holds when unpowered.
+        void SetPower(bool powered);
 
-        // The CLF drives S1 low: the interface returns to DEACTIVATED and all link state is dropped.
-        void Deactivate();
+        // One full-duplex slot on the wire: the bytes the CLF drives on S1, returning the bytes the
+        // UICC drove on S2 in the same slot. Either side may be empty - the link is full duplex, so
+        // the two directions are independent. The bytes are opaque; no framing is added or removed.
+        byte[] Transfer(byte[] data);
 
-        // One full-duplex frame slot on the wire: the CLF transmits wireFrame on S1 and the UICC
-        // transmits its answer on S2. Returns the target's wire frame, or an empty array if the
-        // target had nothing to send in this slot.
-        byte[] ExchangeFrame(byte[] wireFrame);
-
-        // Raised when the target transmits a frame on S2 on its own initiative (an unsolicited SHDLC
-        // I-frame - the SWP equivalent of a device-initiated interrupt). The argument is a complete
-        // wire frame.
-        event Action<ISWPPeripheral, byte[]> FrameAvailable;
-    }
-
-    // SWP interface states of the activation / deactivation sequence (ETSI TS 102 613 clause 6).
-    public enum SWPInterfaceState
-    {
-        // S1 is low: the interface is unpowered and no state is retained.
-        Deactivated,
-        // S1 is being driven; the UICC has announced itself with ACT_SYNC + ACT_INFORMATION.
-        ActSync,
-        // The CLF has answered with ACT_POWER_MODE, selecting low or full power mode.
-        ActPowerMode,
-        // The UICC has acknowledged the power mode with ACT_READY.
-        ActReady,
-        // Activation is complete; SHDLC (or CLT) frames may be exchanged.
-        Activated,
-    }
-
-    // Power mode selected by the CLF in the ACT_POWER_MODE frame (clause 6).
-    public enum SWPPowerMode
-    {
-        LowPower = 0,
-        FullPower = 1,
+        // Raised when the target drives bytes on S2 on its own initiative, without the CLF having
+        // sent anything. SWP is full duplex, so a UICC does not have to wait to be polled.
+        event Action<ISWPPeripheral, byte[]> DataAvailable;
     }
 }

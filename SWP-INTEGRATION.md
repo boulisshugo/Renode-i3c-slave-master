@@ -3,39 +3,50 @@
 How to plug your own SWP (Single Wire Protocol, ETSI TS 102 613) device into the models in this
 repository. Every path below is relative to the repository root.
 
-The short version: the models already implement the framing, the ACT activation sequence and SHDLC on
-**both** sides of the link. You subclass one class, override one method, and write a five-line `.repl`.
-Everything else is inherited and stays correct.
+**The models are a transport, not a protocol stack.** They carry opaque bytes between the CLF and the
+target, in both directions, and track whether the line is powered. They implement no framing, no CRC,
+no ACT activation sequence and no SHDLC — on purpose. If they did, a proprietary SWP stack connected
+to them would be talking *to* that stack instead of *through* the wire, which is the one thing a
+transport must not do. Your design owns the protocol; Renode carries its bytes.
+
+`tools/swp-reference/` has a standalone, tested implementation of those layers if you want to borrow
+or check against one.
 
 **Contents**
 
-1. [What is already done for you](#1-what-is-already-done-for-you)
+1. [What the models do and do not do](#1-what-the-models-do-and-do-not-do)
 2. [File map](#2-file-map)
 3. [Getting the code into a Renode build](#3-getting-the-code-into-a-renode-build)
-4. [Step 1 — write your UICC](#step-1--write-your-uicc)
+4. [Step 1 — write your target](#step-1--write-your-target)
 5. [Step 2 — write the platform file](#step-2--write-the-platform-file)
 6. [Step 3 — drive it](#step-3--drive-it)
-7. [Step 4 — see the raw frames](#step-4--see-the-raw-frames)
+7. [Step 4 — see the raw bytes](#step-4--see-the-raw-bytes)
 8. [Step 5 — connect an external program](#step-5--connect-an-external-program)
-9. [Firmware-managed UICC](#firmware-managed-uicc)
-10. [Matching your silicon](#matching-your-silicon)
+9. [Firmware-managed target](#firmware-managed-target)
+10. [Where your protocol goes](#where-your-protocol-goes)
 11. [Testing your model](#testing-your-model)
 12. [Gotchas that actually bite](#gotchas-that-actually-bite)
 13. [Checklist](#checklist)
 
 ---
 
-## 1. What is already done for you
+## 1. What the models do and do not do
 
-| Layer | Clause | Already implemented |
-|-------|--------|---------------------|
-| Data link | 8 | SOF `7E`, EOF `7F`, MSB-first bit order, bit stuffing (including the end-of-CRC exception), CRC-16 `X¹⁶+X¹²+X⁵+1` init `FFFF` |
-| ACT LLC | 11 | `ACT_SYNC` + `ACT_INFORMATION` → `ACT_POWER_MODE` → `ACT_READY`, and FR-bit frame-resend recovery |
-| SHDLC LLC | 10 | `RSET`/`UA` with window and SREJ negotiation, modulo-8 N(S)/N(R), `RR` acknowledgement, `REJ` with resynchronising retransmission |
-| Physical | 4–7 | **Not implemented** — S1/S2 modulation and timings are abstracted; see [Matching your silicon](#matching-your-silicon) |
+| Layer | Clause | In the Renode peripherals? |
+|-------|--------|----------------------------|
+| SHDLC LLC | 10 | **No** — yours, or `tools/swp-reference/` |
+| ACT LLC | 11 | **No** — yours, or `tools/swp-reference/` |
+| Data link (SOF/EOF, bit stuffing, CRC) | 8 | **No** — yours, or `tools/swp-reference/` |
+| Byte carriage, full duplex, both directions | — | **Yes** |
+| Power state of the line (the CLF owns S1) | — | **Yes** |
+| S1/S2 modulation and electrical timings | 4–7 | No — abstracted |
 
-You are expected to supply only the **application layer**: what your device does with the bytes inside
-an SHDLC I-frame.
+Two consequences worth being clear about:
+
+- **Powering the line runs no handshake.** `PowerUp` drives S1 and moves zero bytes. If your stack
+  performs an ACT exchange, that is simply the first traffic to cross the wire afterwards.
+- **Nothing is framed, so nothing needs escaping.** `7E`, `7F`, runs of `FF` — every byte value
+  crosses unchanged. That is asserted by the test suites.
 
 ---
 
@@ -48,13 +59,10 @@ overlay drops straight in.
 
 | Path | What it is |
 |------|-----------|
-| `renode-overlay/src/Infrastructure/src/Emulator/Main/Peripherals/SWP/ISWPPeripheral.cs` | The UICC contract, plus `SWPInterfaceState` and `SWPPowerMode`. Implement this directly only if you do **not** want the base behaviour. |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SimpleSWPPeripheral.cs` | **The class you subclass.** ACT + SHDLC + framing, with hooks. |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SimpleSWPController.cs` | The CLF (master). Usually you use it as-is. |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPFrame.cs` | Frame codec: `Encode`, `TryDecode`, `ComputeCrc`, and the `Sof`/`Eof`/CRC constants. |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPProtocol.cs` | ACT and SHDLC control-field encodings, frame builders, and `Describe`. **Edit this if your opcodes differ.** |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPFrameRecord.cs` | One traced frame: raw wire image, decoded payload, direction, readable name. |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPTCPBridge.cs` | Raw TCP bridge and the `CreateSWPTCPBridge` monitor command. |
+| `renode-overlay/src/Infrastructure/src/Emulator/Main/Peripherals/SWP/ISWPPeripheral.cs` | The target contract: `Powered`, `SetPower`, `Transfer`, `DataAvailable`. |
+| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SimpleSWPPeripheral.cs` | **The class you subclass.** Transport endpoint with an `OnTransfer` hook and a raw byte trace. |
+| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SimpleSWPController.cs` | The CLF (master). Owns power, carries bytes. Usually used as-is. |
+| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPTCPBridge.cs` | Transparent TCP bridge and the `CreateSWPTCPBridge` monitor command. |
 
 ### Reference implementations to copy from
 
@@ -62,19 +70,21 @@ overlay drops straight in.
 |------|--------------|
 | `.claude/skills/wire-swp-slave/templates/ProprietarySWPSlave.cs` | **Copy-paste starting point** for your class. |
 | `.claude/skills/wire-swp-slave/templates/platform.repl` | Copy-paste starting point for the `.repl`. |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/Mocks/EchoSWPDevice.cs` | The smallest possible UICC — six lines. |
-| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/Mocks/DummySWPTarget.cs` | A UICC with introspection and monitor helpers. |
+| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/Mocks/EchoSWPDevice.cs` | The smallest possible target — six lines. |
+| `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/Mocks/DummySWPTarget.cs` | A target with introspection and monitor helpers. |
+| `tools/swp-reference/` | Framing, CRC, ACT and SHDLC as a standalone library — **not** part of the peripherals. |
 
 ### Platform and test files
 
 | Path | What it is |
 |------|-----------|
-| `renode-overlay/tests/peripherals/SWP.repl` | A CLF with two UICCs, on SWP lines 0 and 1. |
-| `renode-overlay/tests/peripherals/SWP-consistency.repl` | A CLF with an echoing UICC. |
+| `renode-overlay/tests/peripherals/SWP.repl` | A CLF with two targets, on SWP lines 0 and 1. |
+| `renode-overlay/tests/peripherals/SWP-consistency.repl` | A CLF with an echoing target. |
 | `renode-overlay/tests/peripherals/SWP.robot` | Per-feature suite — copy a test case as a template. |
-| `renode-overlay/tests/peripherals/SWP-consistency.robot` | Data-integrity suite. |
-| `renode-overlay/tests/peripherals/SWP-helpers.py` | Python helpers the robot suites use (TCP bridge client, hex utilities). |
-| `tools/swp-selftest/run.sh` | Compiles and exercises the models in seconds without a Renode checkout. |
+| `renode-overlay/tests/peripherals/SWP-consistency.robot` | Byte-integrity suite. |
+| `renode-overlay/tests/peripherals/SWP-helpers.py` | Python helpers the robot suites use. |
+| `tools/swp-selftest/run.sh` | Exercises the transport in seconds, without a Renode checkout. |
+| `tools/swp-reference/selftest.sh` | Exercises the protocol reference, likewise. |
 | `setup.sh` | Clones Renode, overlays these files, builds, runs the suites. |
 
 ---
@@ -99,12 +109,11 @@ cd /path/to/renode
 ./renode-test tests/peripherals/SWP.robot
 ```
 
-The Infrastructure project globs its sources, so **no `.csproj` edits are needed** — a new `.cs` file in
-the right directory is picked up automatically.
+The Infrastructure project globs its sources, so **no `.csproj` edits are needed**.
 
 ---
 
-## Step 1 — write your UICC
+## Step 1 — write your target
 
 Put your class here, so the overlay carries it with the rest:
 
@@ -112,41 +121,35 @@ Put your class here, so the overlay carries it with the rest:
 renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/MyUicc.cs
 ```
 
-Namespace **must** be `Antmicro.Renode.Peripherals.SWP` — the `.repl` type prefix is the namespace tail,
-so that namespace gives you `SWP.MyUicc`. (A wrong prefix produces `Error E04: Could not resolve type`.)
+Namespace **must** be `Antmicro.Renode.Peripherals.SWP` — the `.repl` type prefix is the namespace
+tail, so that namespace gives you `SWP.MyUicc`. (A wrong prefix produces `Error E04: Could not
+resolve type`.)
 
 ```csharp
-using Antmicro.Renode.Logging;
-
 namespace Antmicro.Renode.Peripherals.SWP
 {
     public class MyUicc : SimpleSWPPeripheral
     {
-        public MyUicc()
-        {
-            // Advertised to the CLF in ACT_SYNC. Set it to what your silicon really accepts:
-            // the CLF reads it and refuses to send anything larger.
-            MaxFramePayloadSize = 254;
-            MaxWindowSize = 4;
-        }
-
-        // One well-sequenced SHDLC I-frame arrived. `payload` is the application bytes only -
-        // the control field, CRC and flags have already been taken off.
+        // One full-duplex slot. `incoming` is whatever the CLF drove on S1 - raw bytes, exactly as
+        // they were sent. Return what this target drives on S2 in the same slot, or null.
         //
-        // Return a payload to answer with an I-frame (the acknowledgement rides along in its N(R)),
-        // or null / empty to answer with a bare RR.
-        protected override byte[] OnInformation(byte[] payload)
+        // Your protocol lives here: parse frames out of `incoming`, build frames for the answer.
+        protected override byte[] OnTransfer(byte[] incoming)
         {
-            return HandleApdu(payload);
+            stack.Feed(incoming);
+            return stack.TakePendingBytes();
         }
 
-        // Transmit without being polled - SWP is full duplex. Raises the CLF's IRQ line.
-        private void SensorReady()
+        // The CLF powered the line up or drove S1 low. Reset your stack here.
+        protected override void OnPowerChanged(bool powered)
         {
-            SendInformation(new byte[] { 0xF0, 0x5A });
+            stack.Reset();
         }
 
-        private byte[] HandleApdu(byte[] apdu) => new byte[] { 0x90, 0x00 };
+        // Drive bytes on S2 without being polled - SWP is full duplex. Raises the CLF's IRQ.
+        private void Notify(byte[] bytes) => SendData(bytes);
+
+        private readonly MyProtocolStack stack = new MyProtocolStack();
     }
 }
 ```
@@ -155,29 +158,16 @@ namespace Antmicro.Renode.Peripherals.SWP
 
 | Hook | Fires when | Default |
 |------|-----------|---------|
-| `byte[] OnInformation(byte[] payload)` | a well-sequenced I-frame arrived | next `EnqueueResponsePayload`, else `null` |
-| `void OnLinkEstablished()` | the RSET/UA handshake completed | no-op |
-| `void OnDeactivated()` | the CLF drove S1 low | no-op |
-| `void OnFrameReceived(SWPFrameRecord frame)` | **every** frame in — ACT, SHDLC, malformed | no-op |
-| `void OnFrameSent(SWPFrameRecord frame)` | **every** frame out, at every layer | no-op |
-| `void SendInformation(byte[] payload)` | *you call it* to transmit unprompted | — |
+| `byte[] OnTransfer(byte[] incoming)` | every full-duplex slot | next `EnqueueResponse` block, else nothing |
+| `void OnPowerChanged(bool powered)` | the CLF powers the line up or down | no-op |
+| `void SendData(byte[] data)` | *you call it* to drive S2 unprompted | — |
 
-`Activate()`, `Deactivate()` and `ExchangeFrame()` are `virtual` as well, but override them only if you
-genuinely need to intercept the lifecycle or the raw wire — overriding `OnInformation` keeps ACT and
-SHDLC correct for free, and forgetting to call `base` in the others disables the protocol.
+`SetPower`, `Transfer` and `Reset` are `virtual` too, but override them only if you must — `OnTransfer`
+is the intended seam.
 
-### Capabilities you advertise
-
-These are plain properties, settable in the constructor **or from the `.repl`**:
-
-| Property | Default | Advertised in |
-|----------|---------|---------------|
-| `MaxFramePayloadSize` | 4096 | `ACT_INFORMATION` — the CLF refuses to send more |
-| `ProtocolVersion` | 1 | `ACT_INFORMATION` |
-| `SupportedLlcs` | `Shdlc \| Act` | `ACT_INFORMATION` |
-| `SupportedPowerModes` | `0x03` (both) | `ACT_INFORMATION` |
-| `MaxWindowSize` | 4 | the `UA` answer to `RSET` |
-| `SelectiveRejectSupport` | `false` | the `UA` answer to `RSET` |
+**Byte boundaries are not a protocol.** One `Transfer` delivers one block, but SWP is a bit-serial
+wire: do not assume your peer's frames align with the blocks you receive. Buffer and re-frame in your
+own stack, exactly as you would on real hardware.
 
 ---
 
@@ -190,26 +180,9 @@ uicc: SWP.MyUicc @ swp 0
 ```
 
 **The controller takes no address, and that is deliberate.** The CLF is a separate chip on the far end
-of the SWP line, not a block inside the SoC. It has no register map, so `SimpleSWPController` is neither
-`IDoubleWordPeripheral` nor `IKnownSize`, and it registers on the sysbus with no address at all — giving
-it one would make the bus lie about what is actually memory-mapped, and would suggest firmware could
-reach it through registers, which it cannot. The monitor still addresses it as `sysbus.swp`.
-
-The only thing in an SWP platform that legitimately takes a sysbus address is a **firmware-managed
-UICC**, which really is memory-mapped — see [Firmware-managed UICC](#firmware-managed-uicc).
-
-**Where to set the capabilities.** The most reliable place is your class's constructor, as in Step 1 —
-it is plain C# and cannot be mis-spelled. Renode's `.repl` can also set public properties directly, but
-names there are case-sensitive and must match the C# spelling exactly
-(`MaxFramePayloadSize: 254`); every example in this repo binds *constructor parameters* rather than
-properties, so if a `.repl` line is rejected with a property error, move the value into the constructor
-or set it from the monitor instead:
-
-```
-(machine) swp.uicc MaxFramePayloadSize 254
-```
-
-That monitor form is what `renode-overlay/tests/peripherals/SWP.robot` uses.
+of the SWP line, not a block inside the SoC. It has no register map, so it is neither
+`IDoubleWordPeripheral` nor `IKnownSize`, and it registers on the sysbus with no address at all. The
+monitor still addresses it as `sysbus.swp`.
 
 SWP is point to point, but a CLF commonly has more than one line (one to the UICC, one to an embedded
 SE), so **the registration index is the SWP line number**:
@@ -221,99 +194,72 @@ uicc: SWP.MyUicc @ swp 0
 ese:  SWP.MyEmbeddedSe @ swp 1
 ```
 
-Load it with `machine LoadPlatformDescription @path/to/your.repl`. Working examples live in
-`renode-overlay/tests/peripherals/SWP.repl` and
-`renode-overlay/tests/peripherals/SWP-consistency.repl`.
+Load it with `machine LoadPlatformDescription @path/to/your.repl`.
 
 ---
 
 ## Step 3 — drive it
 
 ```
-(machine) swp Activate 0                    # ACT sequence + SHDLC RSET/UA. -> True
-(machine) swp InterfaceState                # Deactivated / ActSync / ActPowerMode / ActReady / Activated
-(machine) swp LinkEstablished               # -> True
-(machine) swp SendHex 0 "00A40004"          # one I-frame -> the answer's payload, hex
-(machine) swp PollHex 0                     # bare RR, giving the UICC a slot to answer
-(machine) swp Deactivate 0                  # S1 low, all state dropped
+(machine) swp PowerUp 0                     # drives S1. No handshake, no bytes.
+(machine) swp Powered                       # -> True
+(machine) swp TransferHex 0 "00A40004"      # one full-duplex slot -> what came back on S2
+(machine) swp ReceiveHex 0                  # empty S1 slot, giving the target a chance to talk
+(machine) swp PowerDown 0                   # S1 low; the target drops its session state
 ```
 
 Useful state on the CLF:
 
 ```
-swp GetWindowSize 0                  swp GetTargetMaxFramePayloadSize 0
-swp LastReceivedPayloadHex           swp LastReceivedLine
-swp FramesSent / FramesReceived      swp CrcErrors / RejectsReceived / Retransmissions
-swp IRQ IsSet                        swp AcknowledgeInterrupt
+swp LastReceivedHex        swp LastReceivedLine
+swp BytesSent              swp BytesReceived
+swp IRQ IsSet              swp AcknowledgeInterrupt
+swp IsPowered 0            swp PowerUpAll
 ```
 
-Configurable on the CLF before activating: `PowerMode` (`FullPower` / `LowPower`), `WindowSize`,
-`SelectiveRejectSupport`, `ActivationRetries`.
-
-**`Activate` first.** `Send` on a link that was never activated logs *"the SHDLC link is not
-established"* and returns nothing. That is the model working, not a bug.
+**Power up first.** `Transfer` on an unpowered line logs *"is not powered"* and carries nothing. That
+is the model working, not a bug.
 
 ---
 
-## Step 4 — see the raw frames
+## Step 4 — see the raw bytes
 
-Every frame crossing the wire is traced on the target, whichever layer it belongs to, so ACT and SHDLC
-land in one log:
+Every block crossing the wire is traced on the target, in both directions:
 
 ```
-(machine) swp Activate 0
-(machine) swp.uicc FrameTraceHex
-out  7E0101051000032EA47F      ACT_SYNC +5B
-in   7E02016B4C7F              ACT_POWER_MODE full power
-out  7E03D1937F                ACT_READY
-in   7EF882003E66DFC0          Reset +2B
-out  7EE6040012C97F            UnnumberedAcknowledgement +2B
+(machine) swp.uicc TraceHex
+in   00A40004
+out  9000
+out  6F1A
 ```
 
 | Property / method | Gives you |
 |-------------------|-----------|
-| `FrameTraceHex` | the rolling trace, one frame per line |
-| `LastFrameInHex` / `LastFrameOutHex` | the raw on-wire image |
-| `LastPayloadInHex` / `LastPayloadOutHex` | the decoded LLC payload, control field included |
-| `LastFrameIn` / `LastFrameOut` | its readable name |
-| `FrameTraceDepth` | bounds the ring; `0` disables recording (the `Last*` properties stay live). Default 32 |
-| `ClearFrameTrace` | empties it |
-| `ExchangeFrameHex "7E…"` | inject a raw frame, e.g. replaying a capture or a deliberately corrupt one |
+| `TraceHex` | the rolling trace, one block per line |
+| `LastReceivedHex` / `LastSentHex` | the most recent block each way |
+| `TraceDepth` | bounds the ring; `0` disables recording (the `Last*` properties stay live). Default 32 |
+| `ClearTrace` | empties it |
+| `TransferHex "…"` | push a block straight at the target, bypassing the CLF |
 
-Malformed frames are traced too, flagged rather than decoded — a trace that hides bad frames is no use
-for the job you opened it for.
-
-From code, override `OnFrameReceived` / `OnFrameSent`, or subscribe to the `FrameTraced` event if you
-would rather not subclass. Recording happens at the two choke points every frame must pass, which
-matters: **the opening `ACT_SYNC` and unsolicited I-frames never pass through `ExchangeFrame`**, so a
-model that hooks only that method loses them silently.
-
-The framing is also inspectable on its own, which is the quickest way to check a capture:
-
-```
-(machine) swp EncodeFrameHex "C001"                  # -> [0x7E, 0xC0, 0x1, 0x1B, 0x7A, 0x7F]
-(machine) swp DecodeFrameHex "7EC0011B7A7F"          # -> [0xC0, 0x1]   (or "invalid frame: …")
-(machine) swp ComputeFrameCrc "313233343536373839"   # -> 0x29B1, the CRC check value for "123456789"
-```
+Because the transport is transparent, what you see here is exactly what your peer sent — no framing
+has been stripped, so you can decode it against a real capture byte for byte.
 
 ---
 
 ## Step 5 — connect an external program
 
-`SWPTCPBridge` exposes the link over a raw TCP socket. The client speaks **application payloads only** —
-the framing, CRC and SHDLC control byte are added and stripped inside the emulation.
+`SWPTCPBridge` exposes the link over a raw TCP socket, transparently in both directions:
 
 ```
-(machine) swp Activate 0
+(machine) swp PowerUp 0
 (machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456          # synchronous
-(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456 true     # forward-on-unsolicited-frame
+(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456 true     # forward-on-unsolicited-data
 (machine) start
 ```
 
-- **Synchronous** (default): the client's bytes go out as one I-frame and whatever the UICC piggybacks
-  on its acknowledgement streams straight back. Right for a UICC that answers within the same slot.
-- **Forward-on-unsolicited-frame** (`true`): for a UICC whose answer needs CPU time. The client's bytes
-  go out and nothing comes back yet; when the UICC later calls `SendInformation`, that payload is
+- **Synchronous** (default): whatever the target drives on S2 in the same slot streams back.
+- **Forward-on-unsolicited-data** (`true`): for a target whose answer needs CPU time. The client's
+  bytes go out and nothing comes back yet; when the target later calls `SendData`, those bytes are
   forwarded.
 
 ```python
@@ -323,16 +269,19 @@ s.sendall(bytes.fromhex("00A40004"))
 print(s.recv(64).hex())
 ```
 
-**The emulation must be running** (`start`) and the line must be activated first. Every exchange is
-marshalled onto the machine's time domain, so the CLF drives the UICC on the same simulation clock as
-the CPU and a run is reproducible regardless of host timing — but marshalled work only drains while
-virtual time advances.
+This is the natural place to put a protocol stack written in another language: the client speaks raw
+SWP bytes on the socket and does its own framing.
+
+**The emulation must be running** (`start`) and the line powered. Every transfer is marshalled onto
+the machine's time domain, so the CLF drives the target on the same simulation clock as the CPU and a
+run is reproducible regardless of host timing — but marshalled work only drains while virtual time
+advances.
 
 ---
 
-## Firmware-managed UICC
+## Firmware-managed target
 
-If your UICC is driven by firmware on a simulated CPU rather than by C#, register it on **both** the
+If your target is driven by firmware on a simulated CPU rather than by C#, register it on **both** the
 sysbus (memory-mapped registers for the firmware) and the SWP line:
 
 ```repl
@@ -343,72 +292,52 @@ uicc: SWP.MyFirmwareManagedUicc @ {
 ```
 
 Your class then also implements `IDoubleWordPeripheral, IKnownSize`, keeps RX/TX FIFOs, and calls
-`SendInformation(response)` when the firmware writes a commit register. The I3C and SPI counterparts in
-this repo do exactly this and are worth reading as working examples:
+`SendData(response)` when the firmware writes a commit register. The I3C and SPI counterparts do
+exactly this and are worth reading:
 
 - `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SPI/InventedSPITarget.cs`
 - `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/I3C/InventedI3CTarget.cs`
 
-> There is no `InventedSWPTarget` in the repo yet, and no `firmware-swp/` or `java-swp/` directory — the
-> SWP side ships the models, mocks, bridge and tests, but not the firmware-in-the-loop stack the I3C and
-> SPI sides have. The two files above are the pattern to follow if you need one.
+This is the arrangement in which the protocol most naturally lives in firmware, which is where it
+lives on real silicon.
+
+> There is no `InventedSWPTarget` in the repo, and no `firmware-swp/` or `java-swp/` directory — the
+> SWP side ships the transport, mocks, bridge and tests, not a firmware-in-the-loop stack. The two
+> files above are the pattern to follow if you need one.
 
 ---
 
-## Matching your silicon
+## Where your protocol goes
 
-Three things in these models are deliberate simplifications. Change them here and nothing else needs to
-move.
+Three places, depending on what you are testing:
 
-**1. The numeric ACT opcodes and the `ACT_INFORMATION` layout are a profile, not verified spec values.**
-The frame set, the fields they carry and the sequencing follow ETSI TS 102 613, but the specific
-control-byte values were not confirmed against the specification text. They are gathered at the top of
-`renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/SWPProtocol.cs`:
+| Put it in | When |
+|-----------|------|
+| Your `SimpleSWPPeripheral` subclass | you are modelling the UICC in C# |
+| CPU firmware behind a memory-mapped target | you are testing real firmware — closest to silicon |
+| An external client on the TCP bridge | your stack already exists in another language |
 
-```csharp
-public const byte ActSync = 0x01;
-public const byte ActPowerMode = 0x02;
-public const byte ActReady = 0x03;
-public const byte ActPowerModeFullPowerBit = 0x01;
-public const byte ActPowerModeFrameResendBit = 0x02;
-```
-
-`BuildActSync` just below them defines the `ACT_INFORMATION` field order. Both sides of the link and the
-`Describe` helper read these constants, so editing them keeps everything consistent.
-
-The SHDLC encoding, by contrast, **is** the ETSI one as found in shipping stacks (the Linux kernel's
-`net/nfc/hci/llc_shdlc.c`), so leave that alone unless you know otherwise.
-
-**2. The physical layer is abstracted.** S1/S2 pulse-width modulation, current-domain signalling and the
-electrical activation timings are not simulated. `Activate()`, `Deactivate()` and `ExchangeFrame()`
-stand in for them. If you need bit-level S1/S2, it has to be layered underneath — nothing above the wire
-would change.
-
-**3. Frames are not segmented.** A payload larger than the UICC's advertised `MaxFramePayloadSize` is
-refused with a warning rather than split across frames. If your design chains large payloads, implement
-that above `OnInformation` — SHDLC itself does not do reassembly, and neither does this model.
-
-Also absent, kept simple on purpose: the CLT (contactless tunnelling) LLC, SHDLC timers T1/T2/T3, and
-pipelining more than one unacknowledged I-frame — the negotiated window is honoured and reported, but
-the models exchange one frame at a time.
+`tools/swp-reference/` implements the ETSI layers standalone — the clause 8 framing (SOF `7E`, EOF
+`7F`, bit stuffing, CRC-16 `X¹⁶+X¹²+X⁵+1` init `FFFF`), the ACT frames, and the SHDLC control fields.
+It is plain C# you can copy or port, and `tools/swp-reference/selftest.sh` checks it against golden
+vectors. Its numeric ACT opcodes are a profile rather than verified spec values — the constants are
+gathered at the top of `SWPProtocol.cs` for exactly that reason.
 
 ---
 
 ## Testing your model
 
-**Fast loop, no Renode checkout.** `tools/swp-selftest/run.sh` compiles the real SWP sources against
-Renode API stubs and drives them through the codec, activation, SHDLC and the error-recovery paths in a
-couple of seconds:
+**Fast loop, no Renode checkout:**
 
 ```bash
 apt-get install -y mono-mcs mono-runtime     # once
-./tools/swp-selftest/run.sh
+./tools/swp-selftest/run.sh                  # the transport
+./tools/swp-reference/selftest.sh            # the protocol reference
 ```
 
-Add a scenario for your class in `tools/swp-selftest/SWPSelfTest.cs`. It also type-checks the sources,
-so it catches a compile break long before a Renode build finishes. If you change a class the stubs stand
-in for, `tools/swp-selftest/RenodeStubs.cs` may need a matching signature — that is its one maintenance
-cost.
+Both compile the real sources against Renode API stubs and run in seconds; the first also type-checks
+the peripherals, so it catches a compile break long before a Renode build finishes. Add a scenario for
+your class in `tools/swp-selftest/SWPSelfTest.cs`.
 
 **Full loop, inside Renode.** Copy a test case from `renode-overlay/tests/peripherals/SWP.robot`:
 
@@ -416,11 +345,9 @@ cost.
 ./renode-test tests/peripherals/SWP.robot tests/peripherals/SWP-consistency.robot
 ```
 
-`setup.sh` runs both suites (along with the I3C and SPI ones) at the end of a build.
-
-> **Status of the suites in this repo:** the self-test passes (69 checks). The robot suites have been
-> written but not executed here, because that needs a built Renode — run `./setup.sh` to confirm them
-> in your environment before relying on them.
+> **Status of the suites in this repo:** both self-tests pass. The robot suites are written but have
+> not been executed here, because that needs a built Renode — run `./setup.sh` to confirm them in your
+> environment before relying on them.
 
 ---
 
@@ -428,39 +355,23 @@ cost.
 
 **Field initializers, not constructor-body assignment.** The base constructor calls the virtual
 `Reset()`. Anything `Reset()` touches must be a field initializer, or you get a
-`NullReferenceException` at platform-load time:
-
-```csharp
-private readonly Queue<byte[]> pending = new Queue<byte[]>();   // safe
-private readonly object locker = new object();
-```
+`NullReferenceException` at platform-load time.
 
 **`byte[]` parameters are not monitor-bindable.** Expose a `…Hex(string)` helper for anything you want
-to call from the monitor or a robot test; keep the `byte[]` version for C#. This is why
-`ExchangeFrameHex` exists alongside `ExchangeFrame`.
+to call from the monitor or a robot test; keep the `byte[]` version for C#.
 
-**Quote hex arguments in the monitor**, especially long ones: `SendHex 0 "DEAD…"`. Unquoted long tokens
-fail with *"Parameters did not match the signature"*.
+**Quote hex arguments in the monitor**, especially long ones: `TransferHex 0 "DEAD…"`. Unquoted long
+tokens fail with *"Parameters did not match the signature"*.
 
-**Avoid overloads that differ only by an added `string`** — the monitor binds the longer one with
-`null`. Name the variant distinctly.
+**A negative `int` prints as `0xFFFFFFFF`.** Don't assert `== -1` on `LastReceivedLine`.
 
-**A negative `int` prints as `0xFFFFFFFF`.** Don't assert `== -1` on `LastReceivedLine`; assert the
-positive case instead.
+**Don't give the controller a sysbus address out of habit.** It has no register map. Only a
+firmware-managed target gets an address, through the multi-registration form.
 
-**The frame hooks run with the peripheral's lock held** (as `OnInformation` does). A handler must not
-call back into the peripheral.
+**Don't assume block boundaries are frame boundaries.** Buffer and re-frame in your stack.
 
 **The type prefix in a `.repl` is the namespace tail.** `Antmicro.Renode.Peripherals.SWP.MyUicc` is
 `SWP.MyUicc`; a mock in `…Peripherals.Mocks` is `Mocks.DummySWPTarget`.
-
-**Don't give the controller an address out of habit.** `SWP.SimpleSWPController @ sysbus 0x40012000`
-looks natural and is wrong — the controller has no registers. Only a firmware-managed UICC gets an
-address, through the multi-registration form.
-
-**`.repl` attribute names are case-sensitive** and must match the C# constructor parameter or property
-exactly. Prefer the constructor for anything you always want set — it cannot be mis-spelled, and every
-example in this repo does it that way.
 
 ---
 
@@ -468,20 +379,18 @@ example in this repo does it that way.
 
 1. Subclass `SimpleSWPPeripheral` in namespace `Antmicro.Renode.Peripherals.SWP`, under
    `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/`.
-2. Override `OnInformation`; field-initialize anything `Reset()` touches.
-3. Set `MaxFramePayloadSize` and `MaxWindowSize` to what your silicon accepts.
+2. Override `OnTransfer` and put your protocol there; field-initialize anything `Reset()` touches.
+3. Reset your stack in `OnPowerChanged(false)`.
 4. Write the `.repl`: `SWP.SimpleSWPController @ sysbus` (no address) plus `SWP.YourClass @ swp <line>`.
-5. If the ACT opcodes differ from the profile, edit the constants in `SWPProtocol.cs` — nothing else.
-6. `swp Activate <line>` **before** `SendHex`.
-7. Debug with `swp.<name> FrameTraceHex`.
-8. External client: `CreateSWPTCPBridge`, then `start`.
-9. Test with `./tools/swp-selftest/run.sh`, then `./renode-test tests/peripherals/SWP*.robot`.
+5. `swp PowerUp <line>` **before** `TransferHex`.
+6. Debug with `swp.<name> TraceHex`.
+7. External client: `CreateSWPTCPBridge`, power the line, then `start`.
+8. Test with `./tools/swp-selftest/run.sh`, then `./renode-test tests/peripherals/SWP*.robot`.
 
 ---
 
 ## Further reading in this repository
 
-- `README.md` — the SWP counterpart section, with the layer diagram and standards-fidelity notes.
+- `README.md` — the SWP counterpart section.
 - `.claude/skills/wire-swp-slave/SKILL.md` — the same material as a task-oriented skill.
-- `renode-overlay/src/Infrastructure/src/Emulator/Peripherals/Peripherals/SWP/*.cs` — every file carries
-  a header comment explaining the clause it implements and the choices made.
+- `tools/swp-reference/README.md` — why the protocol lives outside the peripherals.
