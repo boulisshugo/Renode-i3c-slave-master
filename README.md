@@ -8,8 +8,8 @@ into, and a controller that can drive them from a C# test-bench, the Renode moni
 
 Most of this README describes the I3C models; the **SPI** counterpart mirrors them one-to-one — see the
 [SPI counterpart](#spi-counterpart) section and the `wire-spi-slave` skill. The **SWP** models are a
-closer-to-the-wire case: SWP's whole substance is its framing and link layer, so those are implemented
-for real — see [SWP counterpart](#swp-counterpart) and the `wire-swp-slave` skill.
+third instance of the same idea — see [SWP counterpart](#swp-counterpart) and the `wire-swp-slave`
+skill. All three are transports: the protocol running over them belongs to whatever is under test.
 
 ## Why transaction-level (method calls) rather than raw SDA/SCL?
 
@@ -56,14 +56,12 @@ Everything below is covered by automated tests (`./setup.sh` builds Renode + fir
 - **Java-driven** (`I3C-java.robot` + `java/run-integration.sh`): the Java bridge drives the firmware
   slave through the whole chain; measured **100% reliability** over 1000+ round-trips (avg latency ~1.3 ms).
 
-The SPI suites (`SPI*.robot`) mirror these one-to-one. The SWP suites cover the protocol layers directly:
-`SWP.robot` checks the frame codec against golden vectors (flags, bit stuffing, the CRC check value and a
-bad-CRC rejection), the ACT activation sequence, SHDLC link establishment and window negotiation,
-sequenced transfer across the modulo-8 wrap, line isolation, unsolicited UICC frames and deactivation;
-`SWP-consistency.robot` checks byte-for-byte integrity for large payloads and for payloads that imitate
-the SOF/EOF flags, over both the direct API and the TCP bridge. `tools/swp-selftest/run.sh` additionally
-drives the SWP models through every protocol scenario in a couple of seconds without a Renode checkout
-(see [Self-test](#self-test-without-a-renode-checkout)).
+The SPI suites (`SPI*.robot`) mirror these one-to-one. The SWP suites cover the transport: `SWP.robot`
+checks power gating, full-duplex byte carriage both ways, line isolation, unsolicited data raising the
+IRQ, the raw byte trace, and that bytes a framed link would have to escape cross unchanged;
+`SWP-consistency.robot` checks byte-for-byte integrity for large blocks over both the direct API and the
+TCP bridge. `tools/swp-selftest/run.sh` drives the transport in seconds without a Renode checkout, and
+`tools/swp-reference/selftest.sh` does the same for the standalone protocol reference.
 
 ## The `II3CPeripheral` contract
 
@@ -297,79 +295,62 @@ a commit (which fires the interrupt), so a half-written response is never shifte
 
 ## SWP counterpart
 
-> **Integrating your own SWP device?** [`SWP-INTEGRATION.md`](SWP-INTEGRATION.md) is a step-by-step
-> guide with the exact paths: where to put your class, what to override, the `.repl`, the monitor
-> commands, how to read the raw frames, and what to change if your silicon differs from the profile.
-
 **SWP** (Single Wire Protocol, [ETSI TS 102 613](https://www.etsi.org/deliver/etsi_ts/102600_102699/102613/))
 is the one-wire link between a **CLF** (Contactless Front-end — the master) and a **UICC** (the slave)
-in an NFC-enabled handset. It is not a register bus like I3C or SPI, so the models here sit lower down:
-the S1/S2 bit modulation is abstracted away, but **everything above it is implemented for real** — frame
-delimiting, bit stuffing, the CRC, the ACT activation sequence and the SHDLC link layer. That is where
-SWP's behaviour actually lives, so a model that skipped it would not be modelling SWP at all.
+in an NFC-enabled handset. Like the I3C and SPI models, the SWP models are a **transport**: they carry
+opaque bytes in both directions and track whether the line is powered, and that is all.
+
+The protocol layers — the clause 8 framing and CRC, the ACT activation sequence of clause 11, SHDLC of
+clause 10 — are deliberately **not** in the peripherals. A transport that ran its own stack would be
+talking *to* a connected proprietary implementation instead of *through* the wire. Those layers belong
+to whatever is under test; `tools/swp-reference/` has a standalone, tested implementation to copy or
+check against.
 
 | File | Role |
 |------|------|
-| `ISWPPeripheral.cs` | The UICC (slave) contract: `Activate` / `Deactivate` / `ExchangeFrame` / `FrameAvailable`, plus the interface-state enum. |
-| `SWPFrame.cs` | Data link layer codec (clause 8): SOF `7E`, bit stuffing, CRC-16, EOF `7F`. |
-| `SWPProtocol.cs` | The ACT and SHDLC control-field encodings and frame builders (clauses 10 and 11). |
-| `SimpleSWPPeripheral.cs` | Agnostic UICC base — ACT and SHDLC done for you, with `virtual` hooks to **subclass for proprietary logic**, and a raw-frame trace. |
-| `SWPFrameRecord.cs` | One traced frame: raw wire image, decoded payload, and a human-readable name. |
-| `SimpleSWPController.cs` | Agnostic CLF (master); a `SimpleContainer<ISWPPeripheral>` keyed by SWP line, running activation, link establishment and sequenced data transfer. |
-| `SWPTCPBridge.cs` | Raw TCP bridge: the client speaks application payloads, the framing and SHDLC happen inside the emulation. |
-| `Mocks/DummySWPTarget.cs` | Ready-to-use mock UICC (records payloads, transmits unprompted). |
-| `Mocks/EchoSWPDevice.cs` | Mock UICC that echoes each payload back (for consistency testing). |
-| `tests/peripherals/SWP*.robot` | Robot suites: per-feature and data consistency. |
-| `tools/swp-selftest/` | Stub-compiled self-test: the protocol scenarios in seconds, no Renode checkout. |
+| `ISWPPeripheral.cs` | The target contract: `Powered`, `SetPower`, `Transfer`, `DataAvailable`. |
+| `SimpleSWPPeripheral.cs` | Agnostic target — transport endpoint with an `OnTransfer` hook and a raw byte trace. **Subclass this.** |
+| `SimpleSWPController.cs` | Agnostic CLF; holds exactly one target (SWP is point to point), owns power, carries bytes. |
+| `SWPTCPBridge.cs` | Transparent TCP bridge: raw bytes in, raw bytes out. |
+| `Mocks/DummySWPTarget.cs` | Ready-to-use mock target (records bytes, drives S2 unprompted). |
+| `Mocks/EchoSWPDevice.cs` | Mock target that echoes each block (for integrity testing). |
+| `tools/swp-reference/` | The ETSI framing, ACT and SHDLC as a standalone library — *not* a peripheral. |
+| `tests/peripherals/SWP*.robot` | Robot suites: per-feature and byte-integrity. |
 
-### The three layers
+### What the wire does, and does not do
 
 ```
-    ┌────────────────────────────────────────────────────────────────────┐
-    │ SHDLC LLC  (clause 10)   I / S / U frames, modulo-8 N(S) & N(R),   │
-    │                          RSET/UA, RR, REJ                          │
-    ├────────────────────────────────────────────────────────────────────┤
-    │ ACT LLC    (clause 11)   ACT_SYNC -> ACT_POWER_MODE -> ACT_READY   │
-    ├────────────────────────────────────────────────────────────────────┤
-    │ Data link  (clause 8)    SOF '7E' | stuffed(payload | CRC) | EOF '7F'│
-    ├────────────────────────────────────────────────────────────────────┤
-    │ Physical                 S1 (CLF -> UICC, voltage), S2 (UICC -> CLF,│
-    │                          current), full duplex        [abstracted]  │
-    └────────────────────────────────────────────────────────────────────┘
+    ┌──────────────┐                                      ┌──────────────┐
+    │     CLF      │ ──── S1, voltage domain ───────────▶ │     UICC     │
+    │   (master)   │ ◀─── S2, current domain ──────────── │   (slave)    │
+    │ owns power   │      one wire, full duplex           │              │
+    └──────────────┘                                      └──────────────┘
+      opaque bytes in both directions — nothing added, nothing removed
 ```
 
-**Data link layer.** A frame is `SOF | bit-stuffed(payload | CRC) | EOF`, MSB first. SOF is `7E`
-(six consecutive ones) and EOF is `7F` (seven). A `0` is stuffed after every run of five ones so those
-flags can never occur inside a frame — except that no stuff bit is added when the run of five ends the
-CRC, because the EOF's own leading `0` already breaks it. The CRC is 16 bits, polynomial
-X<sup>16</sup> + X<sup>12</sup> + X<sup>5</sup> + 1, initial value `FFFF`, over the bits between the
-flags. Stuffing makes a frame a whole number of *bits*, so `SWPFrame.Encode` returns the wire image
-bit-packed and pads the tail with idle `0` bits, and the decoder scans it bitwise.
+Two consequences worth knowing:
 
-**ACT LLC — activation.** The CLF powers S1; the UICC announces itself with `ACT_SYNC` carrying
-`ACT_INFORMATION` (version, supported LLCs, maximum frame payload, power modes); the CLF answers
-`ACT_POWER_MODE` selecting low or full power; the UICC completes with `ACT_READY`. If a frame is lost
-or corrupted the CLF re-sends `ACT_POWER_MODE` with the **FR** bit set, asking the UICC to repeat its
-last ACT frame — and the UICC honours that until it sees a non-ACT frame, which is the only proof it
-has that its `ACT_READY` got through.
-
-**SHDLC LLC — data.** `RSET`/`UA` establish the link and negotiate the window size and SREJ support.
-Data rides modulo-8 sequenced I-frames; the answer is either piggybacked on an I-frame or a bare `RR`.
-An out-of-sequence I-frame draws a `REJ`, and the sender resynchronises to the `REJ`'s N(R) and
-retransmits. All of this is exercised by the test suites.
+- **Powering the line runs no handshake.** `PowerUp` drives S1 and moves zero bytes. If the stack under
+  test performs an ACT exchange, that is just the first traffic to cross the wire afterwards.
+- **Nothing is framed, so nothing needs escaping.** `7E`, `7F`, runs of `FF` — every byte value crosses
+  unchanged, which the test suites assert.
 
 ### Wiring in a platform (`.repl`)
 
-SWP is point to point, but a CLF usually has more than one SWP line (one to the UICC, one to an
-embedded SE), so targets register by **SWP line number**:
+SWP is point to point: one CLF, one wire, one target. There is no addressing on the wire and nothing
+to select, so the controller holds exactly one target and its API takes no line argument. A CLF with
+two SWP interfaces is **two controllers**, which is what the hardware is:
 
 ```repl
 swp: SWP.SimpleSWPController @ sysbus
+uicc: Mocks.DummySWPTarget @ swp
 
-uicc: Mocks.DummySWPTarget @ swp 0
-
-ese: Mocks.DummySWPTarget @ swp 1
+// a second, independent interface - e.g. the link to an embedded SE
+swp2: SWP.SimpleSWPController @ sysbus
+ese: Mocks.DummySWPTarget @ swp2
 ```
+
+Note the target registers with `@ swp` and no index — there is no line to number.
 
 As with the I3C and SPI controllers, the CLF takes **no sysbus address** — it is a separate chip with no
 register map, so claiming address space would misrepresent what is memory-mapped.
@@ -377,139 +358,65 @@ register map, so claiming address space would misrepresent what is memory-mapped
 ### Driving it from the monitor
 
 ```
-(machine) swp Activate 0                       # ACT_SYNC / ACT_POWER_MODE / ACT_READY + RSET/UA
-(machine) swp InterfaceState                   # -> Activated
-(machine) swp LinkEstablished                  # -> True
-(machine) swp GetWindowSize 0                  # window agreed in the RSET handshake
-(machine) swp.uicc EnqueueResponsePayloadHex "0102A0"
-(machine) swp SendHex 0 "DEADBEEF"             # one I-frame -> [0x1, 0x2, 0xA0]
-(machine) swp.uicc RequestServiceWithData "AB" # the UICC transmits unprompted
+(machine) swp PowerUp                        # drives S1. No handshake, no bytes.
+(machine) swp Powered                          # -> True
+(machine) swp.uicc EnqueueResponseHex "0102A0"
+(machine) swp TransferHex "DEADBEEF"         # one full-duplex slot -> [0x1, 0x2, 0xA0]
+(machine) swp ReceiveHex                     # empty S1 slot, letting the target talk
+(machine) swp.uicc SendDataHex "AB"            # the target drives S2 unprompted
 (machine) swp IRQ IsSet                        # -> True
-(machine) swp LastReceivedPayloadHex           # -> [0xAB]
-(machine) swp Deactivate 0                     # drive S1 low, drop all state
-```
-
-The framing is inspectable on its own, which is the quickest way to check a capture against the model:
-
-```
-(machine) swp EncodeFrameHex "C001"                    # -> [0x7E, 0xC0, 0x1, 0x1B, 0x7A, 0x7F]
-(machine) swp DecodeFrameHex "7EC0011B7A7F"            # -> [0xC0, 0x1]
-(machine) swp ComputeFrameCrc "313233343536373839"     # -> 0x29B1, the CRC check value for "123456789"
+(machine) swp LastReceivedHex                  # -> [0xAB]
+(machine) swp.uicc TraceHex                    # raw bytes both ways
+(machine) swp PowerDown
 ```
 
 ### TCP bridge
 
 ```
-(machine) swp Activate 0
-(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456        # synchronous
-(machine) emulation CreateSWPTCPBridge sysbus.swp 0 3456 true   # forward-on-unsolicited-frame
+(machine) swp PowerUp
+(machine) emulation CreateSWPTCPBridge sysbus.swp 3456        # synchronous
+(machine) emulation CreateSWPTCPBridge sysbus.swp 3456 true   # forward-on-unsolicited-data
 (machine) start
 ```
 
-The client speaks raw **application payloads** — the framing, the CRC and the SHDLC control byte are
-added and stripped inside the emulation, exactly as on a real link. As with the I3C and SPI bridges,
-every exchange is marshalled onto the machine's time domain
-(`machine.HandleTimeDomainEvent(..., timeDomainInternalEvent: false)`), so the CLF drives the UICC on
-the same simulation clock as the CPU and a run is reproducible regardless of host timing — which is why
-the emulation must be running.
+Transparent in both directions — the client sends raw bytes and receives raw bytes, so it is a natural
+home for a protocol stack written in another language. As with the I3C and SPI bridges, every transfer
+is marshalled onto the machine's time domain, so the CLF drives the target on the same simulation clock
+as the CPU and a run is reproducible regardless of host timing.
 
-### Wiring a proprietary UICC
-
-Subclass `SimpleSWPPeripheral` and override the hooks; ACT and SHDLC are already handled.
+### Wiring a proprietary target
 
 ```csharp
 namespace Antmicro.Renode.Peripherals.SWP
 {
-    public class MyProprietaryUicc : SimpleSWPPeripheral
+    public class MyUicc : SimpleSWPPeripheral
     {
-        public MyProprietaryUicc()
+        // One full-duplex slot: raw bytes in, raw bytes out. Your protocol lives here.
+        protected override byte[] OnTransfer(byte[] incoming)
         {
-            MaxFramePayloadSize = 254;   // advertised to the CLF in ACT_INFORMATION
+            stack.Feed(incoming);
+            return stack.TakePendingBytes();
         }
 
-        // A well-sequenced I-frame arrived. Return a payload to answer with an I-frame (the
-        // acknowledgement rides along), or null for a bare RR.
-        protected override byte[] OnInformation(byte[] payload)
-        {
-            return HandleApdu(payload);
-        }
+        protected override void OnPowerChanged(bool powered) => stack.Reset();
 
-        protected override void OnLinkEstablished()
-        {
-            // the SHDLC link is up
-        }
+        private void Notify(byte[] bytes) => SendData(bytes);   // drive S2 unprompted
 
-        private void SensorReady()
-        {
-            // transmit without being polled - SWP is full duplex
-            SendInformation(new byte[] { 0xF0, 0x5A });
-        }
+        private readonly MyProtocolStack stack = new MyProtocolStack();
     }
 }
 ```
 
-### Reading the raw frames
-
-Every frame crossing the wire is traced on the target, whichever layer it belongs to — so the ACT
-activation and the SHDLC conversation land in one log, readable straight from the monitor:
-
-```
-(machine) swp Activate 0
-(machine) swp.uicc FrameTraceHex
-out  7E0101051000032EA47F      ACT_SYNC +5B
-in   7E02016B4C7F              ACT_POWER_MODE full power
-out  7E03D1937F                ACT_READY
-in   7EF882003E66DFC0          Reset +2B
-out  7EE6040012C97F            UnnumberedAcknowledgement +2B
-```
-
-`LastFrameInHex` / `LastFrameOutHex` give the raw on-wire image, `LastPayloadInHex` /
-`LastPayloadOutHex` the decoded LLC payload with its control field, and `ExchangeFrameHex` injects a
-raw frame at the target — enough to replay a capture or feed a deliberately corrupt frame without
-writing C#. `FrameTraceDepth` bounds the rolling trace (0 disables it; default 32).
-
-From code, override `OnFrameReceived` / `OnFrameSent`, or subscribe to `FrameTraced`. Recording sits at
-the two choke points every frame must pass, which matters because the opening `ACT_SYNC` and
-unsolicited I-frames never pass through `ExchangeFrame` — a model hooking only that method would lose
-them. Malformed frames are traced too, flagged rather than decoded: a trace that hides bad frames is no
-use for the job you opened it for.
+`SWP-INTEGRATION.md` is the full step-by-step guide, with paths.
 
 ### Self-test without a Renode checkout
 
-The robot suites need Renode built. For a fast check of the protocol logic alone:
-
 ```bash
 apt-get install -y mono-mcs mono-runtime     # once
-./tools/swp-selftest/run.sh
+./tools/swp-selftest/run.sh                  # the transport
+./tools/swp-reference/selftest.sh            # the protocol reference
 ```
 
-It compiles the real SWP sources against a small set of Renode API stubs and runs the CLF and UICC
-through the data link layer, activation, SHDLC and every error-recovery path — golden wire vectors, a
-3200-payload codec fuzz, 200 sequenced round-trips across the modulo-8 wrap, window negotiation,
-out-of-sequence REJ recovery, corrupted frames, a mute UICC and a lost `ACT_READY` recovered by FR. It
-type-checks the sources too, so it catches a compile break early. It does **not** exercise Renode
-itself, the `.repl` loader or the monitor — that is what the robot suites are for.
-
-### Standards fidelity
-
-Taken from the specification and implemented as written: the frame structure and flag values, MSB-first
-bit order, the bit-stuffing rule including the end-of-CRC exception, the CRC polynomial and initial
-value, the ACT frame set and its sequencing including FR-based frame resend, the ACT_INFORMATION fields,
-and the full SHDLC control-byte encoding (I / S / U heads, N(S), N(R), RR/REJ/RNR/SREJ, RSET/UA with
-window and SREJ negotiation) with modulo-8 sequencing.
-
-Two deliberate choices are worth knowing about:
-
-- **The physical layer is abstracted.** S1/S2 pulse-width modulation, the current-domain signalling and
-  the electrical activation timings are not simulated; `Activate` / `Deactivate` / `ExchangeFrame` stand
-  in for them. Everything above the wire is real.
-- **The numeric ACT opcodes and the ACT_INFORMATION byte layout are this model's profile.** The frame
-  set, the fields and the sequencing follow the specification, but the specific control-byte values are
-  gathered in `SWPProtocol` so that matching a particular implementation is a matter of changing those
-  constants and nothing else. The SHDLC encoding, by contrast, is the ETSI one as found in shipping
-  stacks (e.g. the Linux kernel's `net/nfc/hci/llc_shdlc.c`).
-
-Also out of scope, kept simple on purpose: the CLT (contactless tunnelling) LLC, frame segmentation and
-reassembly above the negotiated maximum frame size (an oversized payload is refused with a warning),
-SHDLC timers T1/T2/T3, and pipelining more than one unacknowledged I-frame at a time — the negotiated
-window is honoured and reported but the models exchange one frame at a time.
+Both compile the real sources against Renode API stubs and run in seconds. The first also type-checks
+the peripherals, so it catches a compile break early. Neither exercises Renode itself, the `.repl`
+loader or the monitor — that is what the robot suites are for.

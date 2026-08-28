@@ -1,0 +1,2 @@
+// A CLF with no target registered, for checking that the controller says so rather than crashing.
+swp: SWP.SimpleSWPController @ sysbus

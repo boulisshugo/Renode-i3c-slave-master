@@ -11,6 +11,11 @@ namespace Antmicro.Renode.Peripherals.SWP
 {
     // The SWP data link layer frame codec (ETSI TS 102 613 clause 8).
     //
+    // REFERENCE IMPLEMENTATION - deliberately NOT part of the Renode peripherals. The SWP models in
+    // renode-overlay/ are a transparent transport that carries opaque bytes; the framing below is
+    // provided for whatever implements the protocol on either end of that wire - a proprietary UICC
+    // model, CPU firmware, or an external client on the TCP bridge. Copy it, port it, or ignore it.
+    //
     // A frame on the wire is
     //
     //     SOF ('7E') | bit-stuffed( payload | CRC ) | EOF ('7F')

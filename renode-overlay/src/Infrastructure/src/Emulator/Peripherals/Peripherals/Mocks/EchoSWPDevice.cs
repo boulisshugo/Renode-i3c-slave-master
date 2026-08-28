@@ -8,15 +8,14 @@ using Antmicro.Renode.Peripherals.SWP;
 
 namespace Antmicro.Renode.Peripherals.Mocks
 {
-    // A mock SWP (UICC) target that answers every SHDLC I-frame with an I-frame carrying the same
-    // payload back. Because the answer is piggybacked on the very frame that acknowledges the
-    // request, one Send by the CLF returns the original bytes - handy for end-to-end data-integrity
-    // and consistency testing of the framing, the CRC and the sequencing.
+    // A mock SWP target that drives back on S2 exactly what the CLF drove on S1 in the same
+    // full-duplex slot. Because the transport is transparent, one Transfer by the CLF returns the
+    // original bytes - handy for end-to-end data-integrity testing of the wire and the TCP bridge.
     public class EchoSWPDevice : SimpleSWPPeripheral
     {
-        protected override byte[] OnInformation(byte[] payload)
+        protected override byte[] OnTransfer(byte[] incoming)
         {
-            return payload;
+            return incoming;
         }
     }
 }

@@ -15,212 +15,144 @@ Create Machine
     Execute Command             mach create
     Execute Command             machine LoadPlatformDescription @tests/peripherals/SWP.repl
 
-Create Activated Machine
+Create Powered Machine
     Create Machine
-    ${ok}=                      Execute Command  swp Activate 0
-    Should Be Equal             ${ok.strip()}  True
+    Execute Command             swp PowerUp
 
 *** Test Cases ***
 # --------------------------------------------------------------------------------------------------
-# Data link layer (ETSI TS 102 613 clause 8): SOF/EOF flags, bit stuffing and the CRC
+# Power: the CLF owns it, and it gates the wire. Powering up runs NO activation sequence - the SWP
+# models are a transport, so any ACT exchange belongs to the stack under test.
 # --------------------------------------------------------------------------------------------------
-Should Compute The Standard Frame CRC
+Should Start Unpowered
     Create Machine
 
-    # The CRC is X^16 + X^12 + X^5 + 1 with initial value 'FFFF'; its check value over the ASCII
-    # string "123456789" is '29B1'.
-    ${crc}=                     Execute Command  swp ComputeFrameCrc "313233343536373839"
-    Should Contain              ${crc}  0x29B1
+    ${powered}=                 Execute Command  swp Powered
+    Should Be Equal             ${powered.strip()}  False
+    ${powered}=                 Execute Command  swp.uicc Powered
+    Should Be Equal             ${powered.strip()}  False
 
-    ${reference}=               Swp Crc  313233343536373839
-    Should Be Equal             ${reference}  0x29B1
-
-Should Frame A Payload With SOF EOF And CRC
+Should Power The Line Up And Down
     Create Machine
 
-    # 'C001' is an SHDLC RR acknowledging N(R) = 1. Nothing in it needs stuffing, so the frame is a
-    # plain SOF | payload | CRC | EOF.
-    ${wire}=                    Execute Command  swp EncodeFrameHex "C001"
-    Should Contain              ${wire}  [0x7E, 0xC0, 0x1, 0x1B, 0x7A, 0x7F]
+    Execute Command             swp PowerUp
+    ${powered}=                 Execute Command  swp.uicc Powered
+    Should Be Equal             ${powered.strip()}  True
 
-Should Bit Stuff Runs Of Five Ones
+    Execute Command             swp PowerDown
+    ${powered}=                 Execute Command  swp.uicc Powered
+    Should Be Equal             ${powered.strip()}  False
+
+Should Exchange No Bytes While Powering Up
     Create Machine
 
-    # Four 'FF' bytes are 32 consecutive ones: every run of five gets a 0 inserted, so the frame is
-    # no longer a byte-aligned copy of the payload and the EOF flag can never be imitated.
-    ${wire}=                    Execute Command  swp EncodeFrameHex "FFFFFFFF"
-    Should Contain              ${wire}  [0x7E, 0xFB, 0xEF, 0xBE, 0xFB, 0xEC, 0x74, 0x3D, 0xFC]
+    Execute Command             swp PowerUp
 
-    ${payload}=                 Execute Command  swp DecodeFrameHex "7EFBEFBEFBEC743DFC"
-    Should Contain              ${payload}  [0xFF, 0xFF, 0xFF, 0xFF]
+    # No activation sequence, no handshake - powering the line moves no data at all.
+    ${sent}=                    Execute Command  swp BytesSent
+    Should Be Equal As Numbers  ${sent}  0
+    ${received}=                Execute Command  swp BytesReceived
+    Should Be Equal As Numbers  ${received}  0
+    ${rx}=                      Execute Command  swp.uicc LastReceivedHex
+    Should Contain              ${rx}  []
 
-Should Round Trip A Framed Payload
-    Create Machine
-
-    ${wire}=                    Execute Command  swp EncodeFrameHex "80DEADBEEF"
-    Should Contain              ${wire}  [0x7E, 0x80, 0xDE, 0xAD, 0xBE, 0x77, 0xDD, 0xE2, 0xDF, 0xC0]
-
-    ${payload}=                 Execute Command  swp DecodeFrameHex "7E80DEADBE77DDE2DFC0"
-    Should Contain              ${payload}  [0x80, 0xDE, 0xAD, 0xBE, 0xEF]
-
-Should Reject A Frame With A Bad CRC
-    Create Machine
-
-    # One flipped payload bit in the frame above.
-    ${result}=                  Execute Command  swp DecodeFrameHex "7E809EADBE77DDE2DFC0"
-    Should Contain              ${result}  CRC mismatch
-
-# --------------------------------------------------------------------------------------------------
-# ACT LLC (clause 11): the interface activation sequence
-# --------------------------------------------------------------------------------------------------
-Should Activate The Interface
-    Create Machine
-
-    ${state}=                   Execute Command  swp InterfaceState
-    Should Contain              ${state}  Deactivated
-
-    ${ok}=                      Execute Command  swp Activate 0
-    Should Be Equal             ${ok.strip()}  True
-
-    ${state}=                   Execute Command  swp InterfaceState
-    Should Contain              ${state}  Activated
-    ${state}=                   Execute Command  swp.uicc InterfaceState
-    Should Contain              ${state}  Activated
-
-Should Select The Power Mode In ACT_POWER_MODE
-    Create Machine
-
-    Execute Command             swp PowerMode FullPower
-    Execute Command             swp Activate 0
-
-    ${mode}=                    Execute Command  swp.uicc PowerMode
-    Should Contain              ${mode}  FullPower
-
-Should Read The Capabilities The UICC Advertises In ACT_SYNC
-    Create Activated Machine
-
-    # DummySWPTarget advertises a 4096-byte maximum frame payload by default.
-    ${size}=                    Execute Command  swp GetTargetMaxFramePayloadSize 0
-    Should Be Equal As Numbers  ${size}  4096
-
-Should Refuse A Payload Larger Than The UICC Advertised
+Should Refuse To Transfer On An Unpowered Line
     Create Machine
     Create Log Tester           1
-    Execute Command             swp.uicc MaxFramePayloadSize 8
-    Execute Command             swp Activate 0
 
-    ${answer}=                  Execute Command  swp SendHex 0 "0102030405060708090A"
+    ${answer}=                  Execute Command  swp TransferHex "AABB"
     Should Contain              ${answer}  []
-    Wait For Log Entry          exceeds the 8-byte maximum
+    Wait For Log Entry          is not powered
+
+Should Warn When No Target Is Registered
+    Execute Command             using sysbus
+    Execute Command             mach create
+    Execute Command             machine LoadPlatformDescription @tests/peripherals/SWP-bare.repl
+    Create Log Tester           1
+
+    Execute Command             swp TransferHex "AB"
+    Wait For Log Entry          No SWP target registered on this controller
 
 # --------------------------------------------------------------------------------------------------
-# SHDLC LLC (clause 10): link establishment and sequenced data transfer
+# Full-duplex byte carriage
 # --------------------------------------------------------------------------------------------------
-Should Establish The SHDLC Link
-    Create Activated Machine
+Should Carry Bytes To The Target
+    Create Powered Machine
 
-    ${established}=             Execute Command  swp LinkEstablished
-    Should Be Equal             ${established.strip()}  True
-    ${established}=             Execute Command  swp.uicc LinkEstablished
-    Should Be Equal             ${established.strip()}  True
+    Execute Command             swp TransferHex "DEADBEEF"
 
-    ${window}=                  Execute Command  swp GetWindowSize 0
-    Should Be Equal As Numbers  ${window}  4
-
-Should Negotiate The Window Size Down To What The UICC Accepts
-    Create Machine
-    Execute Command             swp.uicc MaxWindowSize 2
-    Execute Command             swp Activate 0
-
-    ${window}=                  Execute Command  swp GetWindowSize 0
-    Should Be Equal As Numbers  ${window}  2
-
-Should Exchange Data Once The Link Is Up
-    Create Activated Machine
-
-    Execute Command             swp.uicc EnqueueResponsePayloadHex "01020304"
-
-    ${answer}=                  Execute Command  swp SendHex 0 "DEADBEEF"
-    Should Contain              ${answer}  [0x1, 0x2, 0x3, 0x4]
-
-    ${rx}=                      Execute Command  swp.uicc LastReceivedPayloadHex
+    ${rx}=                      Execute Command  swp.uicc LastReceivedHex
     Should Contain              ${rx}  [0xDE, 0xAD, 0xBE, 0xEF]
 
-Should Acknowledge With A Bare RR When The UICC Has Nothing To Say
-    Create Activated Machine
+Should Carry Bytes Back In The Same Slot
+    Create Powered Machine
 
-    ${answer}=                  Execute Command  swp SendHex 0 "AABB"
+    Execute Command             swp.uicc EnqueueResponseHex "01020304"
+
+    ${answer}=                  Execute Command  swp TransferHex "AA"
+    Should Contain              ${answer}  [0x1, 0x2, 0x3, 0x4]
+
+Should Let The Target Talk On An Empty Slot
+    Create Powered Machine
+
+    Execute Command             swp.uicc EnqueueResponseHex "77"
+
+    ${answer}=                  Execute Command  swp ReceiveHex
+    Should Contain              ${answer}  [0x77]
+
+Should Return Nothing When The Target Has Nothing To Say
+    Create Powered Machine
+
+    ${answer}=                  Execute Command  swp TransferHex "AABB"
     Should Contain              ${answer}  []
 
-    ${rx}=                      Execute Command  swp.uicc LastReceivedPayloadHex
-    Should Contain              ${rx}  [0xAA, 0xBB]
+Should Keep Two SWP Interfaces Independent
+    Create Powered Machine
 
-Should Keep The Sequence Numbers In Step Across The Modulo 8 Wrap
-    Create Activated Machine
+    # swp and swp2 are separate wires with separate targets - powering and driving one must not
+    # touch the other.
+    Execute Command             swp TransferHex "AA"
 
-    # N(S) and N(R) are modulo 8, so twenty exchanges wrap them twice. A single slip would make the
-    # UICC answer with a REJ instead of accepting the frame.
-    Repeat Keyword              20 times  Execute Command  swp SendHex 0 "BBCC"
-
-    ${count}=                   Execute Command  swp.uicc ReceivedCount
-    Should Be Equal As Numbers  ${count}  20
-    ${rejects}=                 Execute Command  swp.uicc RejectsSent
-    Should Be Equal As Numbers  ${rejects}  0
-    ${errors}=                  Execute Command  swp CrcErrors
-    Should Be Equal As Numbers  ${errors}  0
-    ${retransmissions}=         Execute Command  swp Retransmissions
-    Should Be Equal As Numbers  ${retransmissions}  0
-
-Should Refuse To Send Before The Link Is Established
-    Create Machine
-    Create Log Tester           1
-
-    ${answer}=                  Execute Command  swp SendHex 0 "AABB"
-    Should Contain              ${answer}  []
-    Wait For Log Entry          the SHDLC link is not established
-
-# --------------------------------------------------------------------------------------------------
-# Point to point: a CLF line addresses exactly one UICC
-# --------------------------------------------------------------------------------------------------
-Should Isolate Traffic To The Addressed SWP Line
-    Create Activated Machine
-
-    Execute Command             swp SendHex 0 "AA"
-
-    ${rx}=                      Execute Command  swp.ese LastReceivedPayloadHex
+    ${rx}=                      Execute Command  swp2.ese LastReceivedHex
     Should Contain              ${rx}  []
-    ${state}=                   Execute Command  swp.ese InterfaceState
-    Should Contain              ${state}  Deactivated
-
-Should Warn On Access To A Missing SWP Line
-    Create Machine
-    Create Log Tester           1
-
-    Execute Command             swp Activate 7
-    Wait For Log Entry          No SWP target registered on line 7
+    ${powered}=                 Execute Command  swp2 Powered
+    Should Be Equal             ${powered.strip()}  False
 
 # --------------------------------------------------------------------------------------------------
-# The UICC transmitting on its own initiative (SWP is full duplex)
+# Transparency: the transport adds and removes nothing, so bytes a framing layer would have to
+# escape pass through untouched.
 # --------------------------------------------------------------------------------------------------
-Should Raise IRQ On An Unsolicited Frame From The UICC
-    Create Activated Machine
+Should Carry Flag-Like Bytes Unchanged
+    Execute Command             using sysbus
+    Execute Command             mach create
+    Execute Command             machine LoadPlatformDescription @tests/peripherals/SWP-consistency.repl
+    Execute Command             swp PowerUp
+
+    # 7E and 7F are the SOF/EOF flags of the framing this transport deliberately does not do, so
+    # they must cross the wire untouched.
+    ${answer}=                  Execute Command  swp TransferHex "7E7F7E7FFFFFFFFF00"
+    Should Contain              ${answer}  [0x7E, 0x7F, 0x7E, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0x0]
+
+# --------------------------------------------------------------------------------------------------
+# The target driving S2 unprompted
+# --------------------------------------------------------------------------------------------------
+Should Raise IRQ On Unsolicited Data
+    Create Powered Machine
 
     ${irq}=                     Execute Command  swp IRQ IsSet
     Should Be Equal             ${irq.strip()}  False
 
-    Execute Command             swp.uicc RequestServiceWithData "112233"
+    Execute Command             swp.uicc SendDataHex "112233"
 
     ${irq}=                     Execute Command  swp IRQ IsSet
     Should Be Equal             ${irq.strip()}  True
-    ${line}=                    Execute Command  swp LastReceivedLine
-    Should Be Equal As Numbers  ${line}  0
-    ${payload}=                 Execute Command  swp LastReceivedPayloadHex
+    ${payload}=                 Execute Command  swp LastReceivedHex
     Should Contain              ${payload}  [0x11, 0x22, 0x33]
 
 Should Acknowledge The Interrupt
-    Create Activated Machine
+    Create Powered Machine
 
-    Execute Command             swp.uicc RequestServiceWithData "44"
+    Execute Command             swp.uicc SendDataHex "44"
     ${irq}=                     Execute Command  swp IRQ IsSet
     Should Be Equal             ${irq.strip()}  True
 
@@ -228,108 +160,43 @@ Should Acknowledge The Interrupt
     ${irq}=                     Execute Command  swp IRQ IsSet
     Should Be Equal             ${irq.strip()}  False
 
-Should Stay In Sequence After An Unsolicited Frame
-    Create Activated Machine
-
-    Execute Command             swp.uicc RequestServiceWithData "5566"
-    Execute Command             swp.uicc EnqueueResponsePayloadHex "77"
-
-    ${answer}=                  Execute Command  swp SendHex 0 "88"
-    Should Contain              ${answer}  [0x77]
-    ${rejects}=                 Execute Command  swp.uicc RejectsSent
-    Should Be Equal As Numbers  ${rejects}  0
-
 # --------------------------------------------------------------------------------------------------
-# Deactivation
+# Raw byte trace on the target
 # --------------------------------------------------------------------------------------------------
-Should Drop All State On Deactivation
-    Create Activated Machine
+Should Trace Both Directions
+    Create Powered Machine
 
-    Execute Command             swp Deactivate 0
+    Execute Command             swp.uicc ClearTrace
+    Execute Command             swp.uicc EnqueueResponseHex "BB"
+    Execute Command             swp TransferHex "AA"
+    Execute Command             swp.uicc SendDataHex "CC"
 
-    ${state}=                   Execute Command  swp InterfaceState
-    Should Contain              ${state}  Deactivated
-    ${state}=                   Execute Command  swp.uicc InterfaceState
-    Should Contain              ${state}  Deactivated
-    ${established}=             Execute Command  swp LinkEstablished
-    Should Be Equal             ${established.strip()}  False
-
-Should Re-Activate After A Deactivation
-    Create Activated Machine
-
-    Execute Command             swp Deactivate 0
-    ${ok}=                      Execute Command  swp Activate 0
-    Should Be Equal             ${ok.strip()}  True
-
-    Execute Command             swp.uicc EnqueueResponsePayloadHex "99"
-    ${answer}=                  Execute Command  swp SendHex 0 "11"
-    Should Contain              ${answer}  [0x99]
-
-# --------------------------------------------------------------------------------------------------
-# Raw frame trace on the slave - every layer, readable without writing C#
-# --------------------------------------------------------------------------------------------------
-Should Trace The Raw Activation Frames
-    Create Activated Machine
-
-    # ACT_SYNC never passes through ExchangeFrame and the RSET/UA pair belongs to a different LLC,
-    # yet all of them are in the one trace.
-    ${trace}=                   Execute Command  swp.uicc FrameTraceHex
-    Should Contain              ${trace}  ACT_SYNC
-    Should Contain              ${trace}  ACT_POWER_MODE full power
-    Should Contain              ${trace}  ACT_READY
-    Should Contain              ${trace}  Reset
-    Should Contain              ${trace}  UnnumberedAcknowledgement
-
-Should Trace The Raw SHDLC Frames
-    Create Activated Machine
-
-    Execute Command             swp.uicc ClearFrameTrace
-    Execute Command             swp.uicc EnqueueResponsePayloadHex "77"
-    Execute Command             swp SendHex 0 "DEAD"
-
-    ${trace}=                   Execute Command  swp.uicc FrameTraceHex
-    Should Contain              ${trace}  I   N(S)=0 N(R)=0
-    Should Contain              ${trace}  I   N(S)=0 N(R)=1
-
-    # The raw wire image, and the payload with its SHDLC control field still on the front.
-    ${wire}=                    Execute Command  swp.uicc LastFrameOutHex
-    Should Contain              ${wire}  [0x7E, 0x81, 0x77
-    ${payload}=                 Execute Command  swp.uicc LastPayloadInHex
-    Should Contain              ${payload}  [0x80, 0xDE, 0xAD]
-
-Should Trace A Malformed Frame Rather Than Drop It Silently
-    Create Activated Machine
-
-    Execute Command             swp.uicc ClearFrameTrace
-    # A valid RR is 7E C0 01 1B 7A 7F; this one carries a corrupted CRC, so it must not be accepted.
-    Execute Command             swp.uicc ExchangeFrameHex "7EC001C67A7F"
-
-    ${trace}=                   Execute Command  swp.uicc FrameTraceHex
-    Should Contain              ${trace}  malformed
-    ${payload}=                 Execute Command  swp.uicc LastPayloadInHex
-    Should Contain              ${payload}  []
+    ${trace}=                   Execute Command  swp.uicc TraceHex
+    Should Contain              ${trace}  in   AA
+    Should Contain              ${trace}  out  BB
+    Should Contain              ${trace}  out  CC
 
 Should Let The Trace Be Turned Off
     Create Machine
-    Execute Command             swp.uicc FrameTraceDepth 0
-    Execute Command             swp Activate 0
+    Execute Command             swp.uicc TraceDepth 0
+    Execute Command             swp PowerUp
+    Execute Command             swp TransferHex "AA"
 
-    ${trace}=                   Execute Command  swp.uicc FrameTraceHex
-    Should Contain              ${trace}  no frames traced
-    # The last frame stays observable even with recording off.
-    ${last}=                    Execute Command  swp.uicc LastFrameOut
-    Should Contain              ${last}  UnnumberedAcknowledgement
+    ${trace}=                   Execute Command  swp.uicc TraceHex
+    Should Contain              ${trace}  nothing traced
+    ${last}=                    Execute Command  swp.uicc LastReceivedHex
+    Should Contain              ${last}  [0xAA]
 
 # --------------------------------------------------------------------------------------------------
-# TCP bridge round-trip
+# TCP bridge round-trip - a transparent pipe, no framing added anywhere
 # --------------------------------------------------------------------------------------------------
-Should Bridge Raw Payloads Over TCP
+Should Bridge Raw Bytes Over TCP
     Execute Command             using sysbus
     Execute Command             mach create
     Execute Command             machine LoadPlatformDescription @tests/peripherals/SWP-consistency.repl
-    Execute Command             swp Activate 0
-    Execute Command             emulation CreateSWPTCPBridge sysbus.swp 0 ${BRIDGE_PORT}
-    # The bridge marshals the exchange into the time domain, so the emulation must be running.
+    Execute Command             swp PowerUp
+    Execute Command             emulation CreateSWPTCPBridge sysbus.swp ${BRIDGE_PORT}
+    # The bridge marshals the transfer into the time domain, so the emulation must be running.
     Start Emulation
 
     ${response}=                Transfer Over Swp Bridge  ${BRIDGE_PORT}  DEADBEEF

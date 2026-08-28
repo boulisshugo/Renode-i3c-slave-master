@@ -53,6 +53,15 @@ else
     echo "   (skipping Java bridge build - JDK not found)"
 fi
 
+if command -v mcs >/dev/null 2>&1 && command -v mono >/dev/null 2>&1; then
+    echo ">> Running the SWP self-tests (transport + protocol reference)"
+    "$HERE/tools/swp-selftest/run.sh" >/dev/null
+    "$HERE/tools/swp-reference/selftest.sh" >/dev/null
+    echo "   both passed"
+else
+    echo "   (skipping the SWP self-tests - mono-mcs not found)"
+fi
+
 echo ">> Running the I3C, SPI and SWP robot suites"
 ( cd "$RENODE_DIR" && ./renode-test \
     tests/peripherals/I3C.robot \

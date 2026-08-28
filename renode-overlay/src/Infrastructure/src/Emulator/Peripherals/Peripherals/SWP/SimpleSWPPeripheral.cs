@@ -15,27 +15,14 @@ namespace Antmicro.Renode.Peripherals.SWP
 {
     // A simple, agnostic SWP target (the UICC side of an ETSI TS 102 613 link).
     //
-    // It implements the standard behaviour a UICC owes the CLF, so a proprietary model only has to
-    // supply application logic:
-    //   - the ACT activation LLC (clause 11): announces itself with ACT_SYNC + ACT_INFORMATION,
-    //     answers ACT_POWER_MODE with ACT_READY, and honours the CLF's frame-resend (FR) request;
-    //   - SHDLC (clause 10): the RSET/UA link-establishment handshake with window and SREJ
-    //     negotiation, modulo-8 N(S)/N(R) sequencing, RR acknowledgements, REJ on an out-of-sequence
-    //     I-frame and retransmission of the last I-frame on receiving a REJ;
-    //   - the data link layer (clause 8): every frame in and out goes through SWPFrame, so the
-    //     bit stuffing and the CRC really are computed and checked.
+    // It is a transport endpoint and nothing more: it carries opaque bytes in both directions and
+    // tracks whether the CLF has powered the interface. It implements no framing, no CRC, no ACT
+    // activation sequence and no SHDLC - see ISWPPeripheral for why, and tools/swp-reference/ for a
+    // standalone implementation of those layers if your test-bench wants one.
     //
-    // Out of the box it answers each I-frame with the next payload queued by EnqueueResponsePayload
-    // (or a bare RR acknowledgement when the queue is empty). Subclass it and override OnInformation
-    // for proprietary behaviour, and call SendInformation to transmit on the UICC's own initiative -
-    // SWP is full duplex, so the UICC does not have to wait to be polled.
-    //
-    // Every frame crossing the wire is traced, whichever layer it belongs to: ACT frames, SHDLC
-    // frames, and frames that failed to decode. Reach the raw bytes through the OnFrameReceived /
-    // OnFrameSent hooks, the FrameTraced event, or - from the monitor and robot tests - the
-    // LastFrameInHex / LastFrameOutHex / FrameTraceHex properties. Recording happens at the two
-    // choke points every frame must pass (Transmit on the way out, the decode in ExchangeFrame on
-    // the way in), so no layer and no code path can slip past it.
+    // Out of the box it answers each transfer with the next block queued by EnqueueResponse (or
+    // nothing when the queue is empty). Subclass it and override OnTransfer for proprietary
+    // behaviour, and call SendData to drive bytes on S2 without being polled.
     //
     // NOTE (same gotcha as the I3C/SPI models): the constructor calls the virtual Reset(), so every
     // field Reset() touches must be a field initializer, not a constructor-body assignment.
@@ -51,551 +38,228 @@ namespace Antmicro.Renode.Peripherals.SWP
             lock(locker)
             {
                 responseQueue.Clear();
-                ClearFrameTrace();
-                ResetLinkState();
-                InterfaceState = SWPInterfaceState.Deactivated;
-                PowerMode = SWPPowerMode.LowPower;
+                trace.Clear();
+                lastReceived = Empty;
+                lastSent = Empty;
+                BytesReceived = 0;
+                BytesSent = 0;
+                Powered = false;
             }
         }
 
         // --------------------------------------------------------------------------------------
-        // ISWPPeripheral - physical / activation control driven by the CLF
+        // ISWPPeripheral
         // --------------------------------------------------------------------------------------
 
-        public SWPInterfaceState InterfaceState { get; private set; } = SWPInterfaceState.Deactivated;
+        public bool Powered { get; private set; }
 
-        // The CLF starts driving S1. The UICC signals that it is ready to communicate by sending the
-        // first ACT_SYNC frame, carrying its ACT_INFORMATION capabilities.
-        public virtual byte[] Activate()
+        public virtual void SetPower(bool powered)
         {
+            bool changed;
             lock(locker)
             {
-                ResetLinkState();
-                InterfaceState = SWPInterfaceState.ActSync;
-                var payload = SWPProtocol.BuildActSync(ProtocolVersion, SupportedLlcs,
-                    (ushort)MaxFramePayloadSize, SupportedPowerModes);
-                lastActPayload = payload;
-                this.Log(LogLevel.Debug, "Interface activated by the CLF; sending ACT_SYNC");
-                return Transmit(payload);
+                changed = powered != Powered;
+                Powered = powered;
+                if(!powered)
+                {
+                    // S1 low: the interface is unpowered and keeps no per-session state.
+                    responseQueue.Clear();
+                    lastReceived = Empty;
+                    lastSent = Empty;
+                }
             }
+            if(!changed)
+            {
+                return;
+            }
+            this.Log(LogLevel.Debug, "Interface {0} by the CLF", powered ? "powered" : "unpowered");
+            OnPowerChanged(powered);
         }
 
-        // The CLF drives S1 low. The interface is unpowered and keeps no state.
-        public virtual void Deactivate()
+        public virtual byte[] Transfer(byte[] data)
         {
+            data = data ?? Empty;
             lock(locker)
             {
-                if(InterfaceState == SWPInterfaceState.Deactivated)
+                if(!Powered)
                 {
-                    return;
+                    this.Log(LogLevel.Warning, "Transfer of {0} byte(s) while the interface is unpowered - ignored",
+                        data.Length);
+                    return Empty;
                 }
-                ResetLinkState();
-                InterfaceState = SWPInterfaceState.Deactivated;
-            }
-            this.Log(LogLevel.Debug, "Interface deactivated by the CLF");
-            OnDeactivated();
-        }
 
-        // One full-duplex frame slot: the CLF's frame arrives on S1, the UICC's answer leaves on S2.
-        public virtual byte[] ExchangeFrame(byte[] wireFrame)
-        {
-            lock(locker)
-            {
-                if(InterfaceState == SWPInterfaceState.Deactivated)
+                if(data.Length > 0)
                 {
-                    this.Log(LogLevel.Warning, "Frame received while the interface is deactivated - ignored");
-                    return Nothing;
+                    BytesReceived += data.Length;
+                    lastReceived = data;
+                    Record(SWPDirection.Received, data);
                 }
-                if(!SWPFrame.TryDecode(wireFrame, out var payload, out var error))
+
+                var outgoing = OnTransfer(data) ?? Empty;
+                if(outgoing.Length > 0)
                 {
-                    FrameErrors++;
-                    // A corrupted frame is simply not acknowledged: the CLF recovers by re-sending
-                    // ACT_POWER_MODE with FR = 1 during activation, or by its SHDLC timeout after.
-                    // It is still traced - a trace that hides bad frames is no use for debugging.
-                    Record(SWPFrameDirection.Received, wireFrame, null, "malformed: " + error);
-                    this.Log(LogLevel.Warning, "Discarding a malformed frame: {0}", error);
-                    return Nothing;
+                    BytesSent += outgoing.Length;
+                    lastSent = outgoing;
+                    Record(SWPDirection.Sent, outgoing);
                 }
-                FramesReceived++;
-                Record(SWPFrameDirection.Received, wireFrame, payload, SWPProtocol.Describe(payload));
-                if(payload.Length == 0)
-                {
-                    this.Log(LogLevel.Warning, "Discarding an empty frame (no control field)");
-                    return Nothing;
-                }
-                if(InterfaceState == SWPInterfaceState.Activated)
-                {
-                    return HandleShdlcFrame(payload);
-                }
-                if(InterfaceState == SWPInterfaceState.ActReady && payload[0] != SWPProtocol.ActPowerMode)
-                {
-                    // ACT_READY has been sent and the CLF has moved on to SHDLC, so it clearly got
-                    // it. Until such a frame arrives the UICC stays in ActReady and keeps answering
-                    // a frame-resend request with ACT_READY again.
-                    InterfaceState = SWPInterfaceState.Activated;
-                    return HandleShdlcFrame(payload);
-                }
-                return HandleActFrame(payload);
+                return outgoing;
             }
         }
 
-        public event Action<ISWPPeripheral, byte[]> FrameAvailable;
-
-        // --------------------------------------------------------------------------------------
-        // Capabilities advertised in ACT_INFORMATION - settable from a .repl
-        // --------------------------------------------------------------------------------------
-
-        // SWP protocol version this UICC supports.
-        public byte ProtocolVersion { get; set; } = 1;
-
-        // The LLCs this UICC supports. SHDLC and ACT are mandatory in both the CLF and the UICC.
-        public SWPProtocol.SupportedLlc SupportedLlcs { get; set; } =
-            SWPProtocol.SupportedLlc.Shdlc | SWPProtocol.SupportedLlc.Act;
-
-        // Largest LLC payload the UICC can receive in one frame, advertised in ACT_INFORMATION.
-        public int MaxFramePayloadSize { get; set; } = 4096;
-
-        // Power modes the UICC supports: bit0 low power, bit1 full power.
-        public byte SupportedPowerModes { get; set; } = 0x03;
-
-        // Largest SHDLC window the UICC will accept in the RSET handshake.
-        public int MaxWindowSize { get; set; } = SWPProtocol.DefaultWindowSize;
-
-        // Whether the UICC offers selective reject in the RSET handshake.
-        public bool SelectiveRejectSupport { get; set; } = SWPProtocol.DefaultSelectiveRejectSupport;
+        public event Action<ISWPPeripheral, byte[]> DataAvailable;
 
         // --------------------------------------------------------------------------------------
         // Observable state - monitor and robot friendly
         // --------------------------------------------------------------------------------------
 
-        // Power mode the CLF selected in ACT_POWER_MODE.
-        public SWPPowerMode PowerMode { get; private set; } = SWPPowerMode.LowPower;
+        // Bytes of the last block received from / sent to the CLF, hex-encoded.
+        public string LastReceivedHex => Misc.PrettyPrintCollectionHex(lastReceived);
+        public string LastSentHex => Misc.PrettyPrintCollectionHex(lastSent);
 
-        // True once the SHDLC RSET/UA handshake has completed.
-        public bool LinkEstablished { get; private set; }
+        public int BytesReceived { get; private set; }
+        public int BytesSent { get; private set; }
 
-        // SHDLC window size agreed with the CLF (the smaller of the two proposals).
-        public int WindowSize { get; private set; } = SWPProtocol.DefaultWindowSize;
-
-        // Payload of the last I-frame received, hex-encoded.
-        public string LastReceivedPayloadHex => Misc.PrettyPrintCollectionHex(lastReceivedPayload);
-
-        public int FramesReceived { get; private set; }
-        public int FramesSent { get; private set; }
-
-        // Frames dropped because their CRC or framing was bad.
-        public int FrameErrors { get; private set; }
-
-        // Number of REJ frames this target has sent (an out-of-sequence I-frame arrived).
-        public int RejectsSent { get; private set; }
-
-        // --------------------------------------------------------------------------------------
-        // Frame trace - the raw wire image of every frame, whichever layer it belongs to
-        // --------------------------------------------------------------------------------------
-
-        // Raw on-wire image of the last frame in / out, hex-encoded (monitor-readable).
-        public string LastFrameInHex => Misc.PrettyPrintCollectionHex(lastFrameIn?.WireFrame ?? EmptyBytes);
-        public string LastFrameOutHex => Misc.PrettyPrintCollectionHex(lastFrameOut?.WireFrame ?? EmptyBytes);
-
-        // Decoded LLC payload of the last frame in / out - control field first - hex-encoded.
-        public string LastPayloadInHex => Misc.PrettyPrintCollectionHex(lastFrameIn?.Payload ?? EmptyBytes);
-        public string LastPayloadOutHex => Misc.PrettyPrintCollectionHex(lastFrameOut?.Payload ?? EmptyBytes);
-
-        // Human-readable name of the last frame in / out, e.g. "ACT_READY" or "I   N(S)=0 N(R)=1 +2B".
-        public string LastFrameIn => lastFrameIn?.Description ?? string.Empty;
-        public string LastFrameOut => lastFrameOut?.Description ?? string.Empty;
-
-        // How many frames the rolling trace keeps. 0 disables recording; the Last* properties above
-        // are always maintained regardless. Settable from a .repl or the monitor.
-        public int FrameTraceDepth
+        // How many blocks the rolling trace keeps. 0 disables it; the Last* properties stay live.
+        public int TraceDepth
         {
-            get => frameTraceDepth;
+            get => traceDepth;
             set
             {
                 lock(locker)
                 {
-                    frameTraceDepth = Math.Max(0, value);
+                    traceDepth = Math.Max(0, value);
                     TrimTrace();
                 }
             }
         }
 
-        // The rolling trace, one frame per line: direction, raw wire bytes, decoded name.
-        public string FrameTraceHex
+        // The rolling trace of raw bytes crossing the wire, one block per line.
+        public string TraceHex
         {
             get
             {
                 lock(locker)
                 {
-                    return frameTrace.Count == 0
-                        ? "(no frames traced)"
-                        : string.Join(Environment.NewLine, frameTrace.Select(x => x.ToString()));
+                    return trace.Count == 0
+                        ? "(nothing traced)"
+                        : string.Join(Environment.NewLine, trace.Select(x => x.Item1 + "  " + PlainHex(x.Item2)));
                 }
             }
         }
 
-        // The traced frames, newest last. Snapshot - safe to enumerate.
-        public IEnumerable<SWPFrameRecord> FrameTrace
-        {
-            get
-            {
-                lock(locker)
-                {
-                    return frameTrace.ToArray();
-                }
-            }
-        }
-
-        public void ClearFrameTrace()
+        public void ClearTrace()
         {
             lock(locker)
             {
-                frameTrace.Clear();
-                lastFrameIn = null;
-                lastFrameOut = null;
+                trace.Clear();
             }
         }
 
-        // Raised for every frame crossing the wire in either direction, at every layer - ACT frames,
-        // SHDLC frames and malformed ones alike. Subscribe instead of subclassing when a bridge or a
-        // test wants the raw bytes.
-        //
-        // Fired while the peripheral's lock is held (as OnInformation is): a handler must not call
-        // back into this peripheral.
-        public event Action<ISWPPeripheral, SWPFrameRecord> FrameTraced;
-
-        // Queues one payload to be returned in an I-frame in answer to the next I-frame received.
-        public void EnqueueResponsePayload(IEnumerable<byte> payload)
+        // Queues one block to be driven on S2 in answer to the next transfer.
+        public void EnqueueResponse(IEnumerable<byte> data)
         {
             lock(locker)
             {
-                responseQueue.Enqueue(payload.ToArray());
+                responseQueue.Enqueue(data.ToArray());
             }
         }
 
-        // Monitor-friendly helper: queue one response payload from a hex string, e.g. "0102ab".
-        public void EnqueueResponsePayloadHex(string hexPayload)
+        // Monitor-friendly helper: queue one response block from a hex string, e.g. "0102ab".
+        public void EnqueueResponseHex(string hexData)
         {
-            EnqueueResponsePayload(Misc.HexStringToByteArray(hexPayload));
+            EnqueueResponse(Misc.HexStringToByteArray(hexData));
         }
 
-        // Monitor-friendly helper: push a raw wire frame straight at the target, as if the CLF had
-        // sent it, and get its answer back hex-encoded. Useful for replaying a capture or feeding a
-        // deliberately corrupt frame without writing a C# test-bench (ExchangeFrame itself takes a
-        // byte[], which the monitor cannot bind).
-        public string ExchangeFrameHex(string hexWireFrame)
+        // Monitor-friendly helper: push a raw block at the target as if the CLF had driven it, and
+        // get back whatever the target drove on S2 in the same slot.
+        public string TransferHex(string hexData)
         {
-            return Misc.PrettyPrintCollectionHex(ExchangeFrame(Misc.HexStringToByteArray(hexWireFrame)));
+            return Misc.PrettyPrintCollectionHex(Transfer(Misc.HexStringToByteArray(hexData)));
         }
 
         // --------------------------------------------------------------------------------------
         // Hooks for proprietary targets
         // --------------------------------------------------------------------------------------
 
-        // Called with the payload of a well-sequenced SHDLC I-frame. Return a payload to answer with
-        // an I-frame of our own (the acknowledgement rides along in its N(R)); return null or an
-        // empty array to answer with a bare RR acknowledgement.
+        // Called for every full-duplex slot. `incoming` is what the CLF drove on S1 (possibly
+        // empty); return what this target drives on S2 in the same slot, or null for nothing.
+        // The bytes are opaque - whatever protocol runs on the line is yours to implement here.
         //
-        // Default: the next payload queued with EnqueueResponsePayload, else null.
-        protected virtual byte[] OnInformation(byte[] payload)
+        // Default: the next block queued with EnqueueResponse, else nothing.
+        protected virtual byte[] OnTransfer(byte[] incoming)
         {
             return responseQueue.Count > 0 ? responseQueue.Dequeue() : null;
         }
 
-        // Called once the SHDLC RSET/UA handshake has completed. Default: no-op.
-        protected virtual void OnLinkEstablished()
+        // Called when the CLF powers the interface up (true) or drives S1 low (false).
+        protected virtual void OnPowerChanged(bool powered)
         {
         }
 
-        // Called when the CLF deactivates the interface. Default: no-op.
-        protected virtual void OnDeactivated()
+        // Drives bytes on S2 without being polled. Raises DataAvailable.
+        protected void SendData(byte[] data)
         {
-        }
-
-        // Called for every frame received from the CLF, before it is acted on - ACT frames, SHDLC
-        // frames, and frames that failed to decode (frame.IsMalformed). Default: no-op.
-        //
-        // Runs with the peripheral's lock held; do not call back into this peripheral from it.
-        protected virtual void OnFrameReceived(SWPFrameRecord frame)
-        {
-        }
-
-        // Called for every frame this peripheral transmits, at every layer: the ACT_SYNC that opens
-        // activation, every ACT and SHDLC answer, and unsolicited I-frames from SendInformation.
-        // Default: no-op.
-        //
-        // Runs with the peripheral's lock held; do not call back into this peripheral from it.
-        protected virtual void OnFrameSent(SWPFrameRecord frame)
-        {
-        }
-
-        // Transmits an I-frame on the UICC's own initiative (SWP is full duplex, so the UICC may
-        // transmit on S2 without being polled). Raises FrameAvailable with the complete wire frame.
-        protected void SendInformation(byte[] payload)
-        {
-            byte[] wire;
+            data = data ?? Empty;
             lock(locker)
             {
-                if(!LinkEstablished)
+                if(!Powered)
                 {
-                    this.Log(LogLevel.Warning, "Cannot send an I-frame: the SHDLC link is not established");
+                    this.Log(LogLevel.Warning, "Cannot drive S2: the interface is not powered");
                     return;
                 }
-                wire = Transmit(BuildAndRecordInformation(payload));
-            }
-            this.Log(LogLevel.Debug, "Transmitting an unsolicited {0}-byte I-frame", payload?.Length ?? 0);
-            FrameAvailable?.Invoke(this, wire);
-        }
-
-        // --------------------------------------------------------------------------------------
-        // ACT LLC
-        // --------------------------------------------------------------------------------------
-
-        private byte[] HandleActFrame(byte[] payload)
-        {
-            var control = payload[0];
-            if(control != SWPProtocol.ActPowerMode)
-            {
-                this.Log(LogLevel.Warning, "Unexpected ACT control field 0x{0:X2} in state {1}", control, InterfaceState);
-                return Nothing;
-            }
-
-            var parameter = payload.Length > 1 ? payload[1] : (byte)0;
-            if((parameter & SWPProtocol.ActPowerModeFrameResendBit) != 0)
-            {
-                // FR = 1: the CLF did not get our last ACT frame intact, so repeat it verbatim.
-                this.Log(LogLevel.Debug, "ACT_POWER_MODE with FR = 1; repeating the last ACT frame");
-                return lastActPayload != null ? Transmit(lastActPayload) : Nothing;
-            }
-
-            PowerMode = (parameter & SWPProtocol.ActPowerModeFullPowerBit) != 0
-                ? SWPPowerMode.FullPower
-                : SWPPowerMode.LowPower;
-            InterfaceState = SWPInterfaceState.ActPowerMode;
-
-            // Acknowledge with ACT_READY and rest in ActReady. The UICC cannot know that frame
-            // arrived intact: if the CLF asks again with FR = 1 we repeat it, and only the first
-            // non-ACT frame proves the CLF is done activating (see ExchangeFrame).
-            var ready = SWPProtocol.BuildActReady();
-            lastActPayload = ready;
-            InterfaceState = SWPInterfaceState.ActReady;
-            this.Log(LogLevel.Debug, "ACT_POWER_MODE ({0}); answering ACT_READY", PowerMode);
-            return Transmit(ready);
-        }
-
-        // --------------------------------------------------------------------------------------
-        // SHDLC LLC
-        // --------------------------------------------------------------------------------------
-
-        private byte[] HandleShdlcFrame(byte[] payload)
-        {
-            var control = payload[0];
-            switch(SWPProtocol.GetFrameKind(control))
-            {
-            case SWPProtocol.ShdlcFrameKind.Unnumbered:
-                return HandleUnnumbered(control, payload);
-            case SWPProtocol.ShdlcFrameKind.Supervisory:
-                return HandleSupervisory(control);
-            default:
-                return HandleInformation(control, payload);
-            }
-        }
-
-        private byte[] HandleUnnumbered(byte control, byte[] payload)
-        {
-            var modifier = SWPProtocol.GetModifier(control);
-            if(modifier != SWPProtocol.UnnumberedFrameModifier.Reset)
-            {
-                this.Log(LogLevel.Warning, "Unhandled U-frame modifier 0x{0:X2}", (int)modifier);
-                return Nothing;
-            }
-
-            // RSET: restart the link. The parameters the CLF proposes are a window size and whether
-            // it supports selective reject; we accept the smaller window and the intersection of the
-            // SREJ support, and echo what we accepted back in the UA.
-            var proposedWindow = payload.Length > 1 ? payload[1] : SWPProtocol.DefaultWindowSize;
-            var proposedSrej = payload.Length > 2 && (payload[2] & 0x01) != 0;
-
-            ResetLinkState();
-            WindowSize = Math.Max(1, Math.Min(proposedWindow, MaxWindowSize));
-            var srej = proposedSrej && SelectiveRejectSupport;
-            LinkEstablished = true;
-
-            this.Log(LogLevel.Debug, "SHDLC RSET accepted (window {0}, SREJ {1}); answering UA", WindowSize, srej);
-            var ua = SWPProtocol.BuildUnnumbered(SWPProtocol.UnnumberedFrameModifier.UnnumberedAcknowledgement,
-                SWPProtocol.BuildResetParameters((byte)WindowSize, srej));
-            var wire = Transmit(ua);
-            OnLinkEstablished();
-            return wire;
-        }
-
-        private byte[] HandleSupervisory(byte control)
-        {
-            var type = SWPProtocol.GetSupervisoryType(control);
-            AcknowledgeUpTo(SWPProtocol.GetReceiveSequence(control));
-            switch(type)
-            {
-            case SWPProtocol.SupervisoryFrameType.ReceiveReady:
-                return Nothing;
-            case SWPProtocol.SupervisoryFrameType.Reject:
-                // The CLF missed our last I-frame. Its REJ names the N(R) it wants next, so
-                // resynchronise to that and send the buffered payload again.
-                if(lastInformationPayload == null)
+                if(data.Length == 0)
                 {
-                    return Nothing;
+                    return;
                 }
-                var wanted = SWPProtocol.GetReceiveSequence(control);
-                this.Log(LogLevel.Debug, "REJ received; retransmitting I-frame with N(S) = {0}", wanted);
-                lastInformationSequence = wanted;
-                sendSequence = (wanted + 1) % SWPProtocol.SequenceModulo;
-                return Transmit(SWPProtocol.BuildInformation(wanted, receiveSequence, lastInformationPayload));
-            default:
-                this.Log(LogLevel.Debug, "S-frame {0} received", type);
-                return Nothing;
+                BytesSent += data.Length;
+                lastSent = data;
+                Record(SWPDirection.Sent, data);
             }
-        }
-
-        private byte[] HandleInformation(byte control, byte[] payload)
-        {
-            if(!LinkEstablished)
-            {
-                this.Log(LogLevel.Warning, "I-frame received before the SHDLC link was established - ignored");
-                return Nothing;
-            }
-
-            var theirSendSequence = SWPProtocol.GetSendSequence(control);
-            AcknowledgeUpTo(SWPProtocol.GetReceiveSequence(control));
-
-            if(theirSendSequence != receiveSequence)
-            {
-                // Out of sequence: ask for a retransmission from the frame we do expect.
-                RejectsSent++;
-                this.Log(LogLevel.Warning, "Out-of-sequence I-frame: N(S) = {0}, expected {1}; sending REJ",
-                    theirSendSequence, receiveSequence);
-                return Transmit(SWPProtocol.BuildSupervisory(SWPProtocol.SupervisoryFrameType.Reject,
-                    receiveSequence));
-            }
-
-            var information = new byte[payload.Length - 1];
-            Array.Copy(payload, 1, information, 0, information.Length);
-            lastReceivedPayload = information;
-            receiveSequence = (receiveSequence + 1) % SWPProtocol.SequenceModulo;
-
-            var response = OnInformation(information);
-            if(response == null || response.Length == 0)
-            {
-                // Nothing to say: acknowledge with a bare RR carrying our updated N(R).
-                return Transmit(SWPProtocol.BuildSupervisory(SWPProtocol.SupervisoryFrameType.ReceiveReady,
-                    receiveSequence));
-            }
-            // Piggyback the acknowledgement on our own I-frame.
-            return Transmit(BuildAndRecordInformation(response));
+            this.Log(LogLevel.Debug, "Driving {0} unsolicited byte(s) on S2", data.Length);
+            DataAvailable?.Invoke(this, data);
         }
 
         // --------------------------------------------------------------------------------------
 
-        private byte[] BuildAndRecordInformation(byte[] payload)
+        private void Record(SWPDirection direction, byte[] data)
         {
-            payload = payload ?? new byte[0];
-            lastInformationPayload = payload;
-            lastInformationSequence = sendSequence;
-            var frame = SWPProtocol.BuildInformation(sendSequence, receiveSequence, payload);
-            sendSequence = (sendSequence + 1) % SWPProtocol.SequenceModulo;
-            return frame;
-        }
-
-        // The CLF's N(R) acknowledges everything it has received; once it covers our last I-frame we
-        // no longer need to keep it for a possible retransmission.
-        private void AcknowledgeUpTo(int theirReceiveSequence)
-        {
-            if(lastInformationPayload != null && theirReceiveSequence == sendSequence)
+            if(traceDepth <= 0)
             {
-                lastInformationPayload = null;
+                return;
             }
-        }
-
-        // Every frame this peripheral sends goes through here - the ACT_SYNC from Activate, every
-        // ACT and SHDLC answer, and the unsolicited I-frames from SendInformation - so recording at
-        // this one point cannot miss a layer.
-        private byte[] Transmit(byte[] payload)
-        {
-            FramesSent++;
-            var wire = SWPFrame.Encode(payload);
-            Record(SWPFrameDirection.Sent, wire, payload, SWPProtocol.Describe(payload));
-            return wire;
-        }
-
-        // Called with the lock held, from the two choke points (Transmit and the decode in
-        // ExchangeFrame), so no frame reaches the wire without passing through it.
-        private void Record(SWPFrameDirection direction, byte[] wireFrame, byte[] payload, string description)
-        {
-            var record = new SWPFrameRecord(direction, wireFrame, payload, description);
-            if(direction == SWPFrameDirection.Received)
-            {
-                lastFrameIn = record;
-            }
-            else
-            {
-                lastFrameOut = record;
-            }
-
-            if(frameTraceDepth > 0)
-            {
-                frameTrace.Enqueue(record);
-                TrimTrace();
-            }
-
-            this.Log(LogLevel.Noisy, "{0}", record);
-            if(direction == SWPFrameDirection.Received)
-            {
-                OnFrameReceived(record);
-            }
-            else
-            {
-                OnFrameSent(record);
-            }
-            FrameTraced?.Invoke(this, record);
+            trace.Enqueue(Tuple.Create(direction == SWPDirection.Received ? "in " : "out", data));
+            TrimTrace();
         }
 
         private void TrimTrace()
         {
-            while(frameTrace.Count > frameTraceDepth)
+            while(trace.Count > traceDepth)
             {
-                frameTrace.Dequeue();
+                trace.Dequeue();
             }
         }
 
-        private void ResetLinkState()
+        private static string PlainHex(byte[] data)
         {
-            LinkEstablished = false;
-            WindowSize = SWPProtocol.DefaultWindowSize;
-            sendSequence = 0;
-            receiveSequence = 0;
-            lastInformationPayload = null;
-            lastInformationSequence = 0;
-            lastActPayload = null;
-            lastReceivedPayload = new byte[0];
+            return string.Concat(data.Select(x => x.ToString("X2")));
         }
 
-        private int sendSequence;
-        private int receiveSequence;
-        private int lastInformationSequence;
-        private byte[] lastInformationPayload;
-        private byte[] lastActPayload;
-        private byte[] lastReceivedPayload = new byte[0];
+        private enum SWPDirection
+        {
+            Received,
+            Sent,
+        }
 
-        private SWPFrameRecord lastFrameIn;
-        private SWPFrameRecord lastFrameOut;
-        private int frameTraceDepth = DefaultFrameTraceDepth;
+        private byte[] lastReceived = new byte[0];
+        private byte[] lastSent = new byte[0];
+        private int traceDepth = DefaultTraceDepth;
 
-        private readonly Queue<SWPFrameRecord> frameTrace = new Queue<SWPFrameRecord>();
+        private readonly Queue<Tuple<string, byte[]>> trace = new Queue<Tuple<string, byte[]>>();
         private readonly Queue<byte[]> responseQueue = new Queue<byte[]>();
         private readonly object locker = new object();
 
-        // Frames kept by default. Cheap - the trace stores references to arrays that already exist.
-        private const int DefaultFrameTraceDepth = 32;
+        private const int DefaultTraceDepth = 32;
 
-        private static readonly byte[] Nothing = new byte[0];
-        private static readonly byte[] EmptyBytes = new byte[0];
+        private static readonly byte[] Empty = new byte[0];
     }
 }
